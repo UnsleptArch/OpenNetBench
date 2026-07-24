@@ -35,10 +35,23 @@ pub enum Vector {
     DnsFlood,
     /// L4 — connection-pool exhaustion; fills the accept() backlog.
     TcpExhaust,
+    /// L7 — Slow Read: tiny receive window, drain the response byte-by-byte so
+    /// the server holds its send buffer and connection open.
+    SlowRead,
+    /// L7 — CVE-2011-3192 Range header with many overlapping ranges; forces
+    /// costly multipart response assembly.
+    RangeFlood,
+    /// L7 — full multiplexed HTTP/2 request flood (completed streams).
+    H2Flood,
+    /// L4 — TCP ACK flood via raw socket (requires root); stresses stateful
+    /// firewall / conntrack state tables.
+    AckFlood,
+    /// L3 — ICMP echo flood via raw socket (requires root).
+    IcmpFlood,
 }
 
 impl Vector {
-    pub const ALL: [Vector; 10] = [
+    pub const ALL: [Vector; 15] = [
         Vector::HttpFlood,
         Vector::HttpsOnly,
         Vector::H2RapidReset,
@@ -49,6 +62,11 @@ impl Vector {
         Vector::UdpFlood,
         Vector::DnsFlood,
         Vector::TcpExhaust,
+        Vector::SlowRead,
+        Vector::RangeFlood,
+        Vector::H2Flood,
+        Vector::AckFlood,
+        Vector::IcmpFlood,
     ];
 
     pub fn slug(self) -> &'static str {
@@ -63,6 +81,11 @@ impl Vector {
             Vector::UdpFlood => "udp_flood",
             Vector::DnsFlood => "dns_flood",
             Vector::TcpExhaust => "tcp_exhaust",
+            Vector::SlowRead => "slow_read",
+            Vector::RangeFlood => "range_flood",
+            Vector::H2Flood => "h2_flood",
+            Vector::AckFlood => "ack_flood",
+            Vector::IcmpFlood => "icmp_flood",
         }
     }
 
@@ -71,14 +94,19 @@ impl Vector {
             Vector::SynFlood
             | Vector::UdpFlood
             | Vector::TcpExhaust
-            | Vector::TlsExhaust => "L4",
+            | Vector::TlsExhaust
+            | Vector::AckFlood => "L4",
+            Vector::IcmpFlood => "L3",
             _ => "L7",
         }
     }
 
     /// Whether the vector needs raw socket access (root/CAP_NET_RAW).
     pub fn needs_root(self) -> bool {
-        matches!(self, Vector::SynFlood)
+        matches!(
+            self,
+            Vector::SynFlood | Vector::AckFlood | Vector::IcmpFlood
+        )
     }
 
     pub fn description(self) -> &'static str {
@@ -93,6 +121,11 @@ impl Vector {
             Vector::UdpFlood => "UDP flood — configurable port and payload",
             Vector::DnsFlood => "Random-subdomain DNS query flood",
             Vector::TcpExhaust => "Connection pool exhaustion — fills accept() backlog",
+            Vector::SlowRead => "Slow response drain — tiny window holds server send buffer",
+            Vector::RangeFlood => "CVE-2011-3192 overlapping Range headers — costly assembly",
+            Vector::H2Flood => "Multiplexed HTTP/2 request flood over one connection",
+            Vector::AckFlood => "TCP ACK flood via raw socket — stresses firewall/conntrack",
+            Vector::IcmpFlood => "ICMP echo flood via raw socket (requires root)",
         }
     }
 }
@@ -141,7 +174,7 @@ impl VectorTuning {
     /// Sensible small-scale defaults for a given vector.
     pub fn defaults_for(v: Vector) -> Self {
         match v {
-            Vector::Slowloris => VectorTuning {
+            Vector::Slowloris | Vector::SlowRead => VectorTuning {
                 concurrency: 200,
                 rate_per_worker: 0,
                 payload_bytes: 0,
@@ -162,14 +195,18 @@ impl VectorTuning {
                 trickle_interval: Duration::from_millis(0),
                 port: 0,
             },
-            Vector::SynFlood | Vector::TcpExhaust => VectorTuning {
+            Vector::SynFlood
+            | Vector::TcpExhaust
+            | Vector::AckFlood
+            | Vector::IcmpFlood => VectorTuning {
                 concurrency: 500,
                 rate_per_worker: 0,
                 payload_bytes: 0,
                 trickle_interval: Duration::from_millis(0),
                 port: 0,
             },
-            // HttpFlood, HttpsOnly, H2RapidReset, TlsExhaust, DnsFlood
+            // HttpFlood, HttpsOnly, H2RapidReset, TlsExhaust, DnsFlood,
+            // RangeFlood, H2Flood
             _ => VectorTuning {
                 concurrency: 50,
                 rate_per_worker: 0,

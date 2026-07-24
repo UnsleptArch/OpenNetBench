@@ -5,12 +5,17 @@
 //! the collapse curve. Vector workers live in submodules; this module wires
 //! them together and paces them.
 
+mod ack_flood;
 mod dns_flood;
+mod h2_flood;
 mod h2_rapid_reset;
 mod histogram;
 mod http_flood;
+mod icmp_flood;
 mod net;
+mod raw;
 mod rudy;
+mod slow_read;
 mod slowloris;
 mod syn_flood;
 mod tcp_exhaust;
@@ -269,6 +274,69 @@ pub async fn run(cfg: &RunConfig) -> Result<()> {
             Vector::SynFlood => {
                 for idx in 0..plan.tuning.concurrency {
                     handles.push(tokio::spawn(syn_flood::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            // Range flood reuses the http_flood worker with a Range template.
+            Vector::RangeFlood => {
+                let templates = net::build_range_templates(&target.host, &target.path);
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(http_flood::worker(
+                        idx,
+                        target.clone(),
+                        templates.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.rate_per_worker,
+                    )));
+                }
+            }
+            Vector::SlowRead => {
+                let templates = net::build_get_templates(&target.host, &target.path);
+                let request: Arc<[u8]> = Arc::from(templates[0].as_ref());
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(slow_read::worker(
+                        idx,
+                        target.clone(),
+                        request.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.trickle_interval,
+                    )));
+                }
+            }
+            Vector::H2Flood => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(h2_flood::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            Vector::AckFlood => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(ack_flood::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            Vector::IcmpFlood => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(icmp_flood::worker(
                         idx,
                         target.clone(),
                         metrics.clone(),
