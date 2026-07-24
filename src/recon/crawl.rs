@@ -137,3 +137,37 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
         Some(rest[..end].to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_links_and_forms() {
+        let html = r##"<a href="/about">A</a><img src="/img/logo.png">
+            <a href="#skip">x</a><a href="javascript:void(0)">y</a>
+            <form action="/search" method="get"><input name="q"></form>
+            <FORM ACTION="/submit" METHOD="POST"></FORM>"##;
+        let refs = extract_refs(html);
+
+        let links: Vec<&String> = refs
+            .iter()
+            .filter_map(|(k, v)| matches!(k, RefKind::Link).then_some(v))
+            .collect();
+        assert!(links.iter().any(|l| l.as_str() == "/about"));
+        assert!(links.iter().any(|l| l.as_str() == "/img/logo.png"));
+        // Anchors and javascript: pseudo-links are skipped.
+        assert!(!links.iter().any(|l| l.starts_with('#')));
+        assert!(!links.iter().any(|l| l.starts_with("javascript:")));
+
+        let forms: Vec<(&String, &String)> = refs
+            .iter()
+            .filter_map(|(k, v)| match k {
+                RefKind::Form(m) => Some((m, v)),
+                _ => None,
+            })
+            .collect();
+        assert!(forms.iter().any(|(m, a)| m.as_str() == "GET" && a.as_str() == "/search"));
+        assert!(forms.iter().any(|(m, a)| m.as_str() == "POST" && a.as_str() == "/submit"));
+    }
+}

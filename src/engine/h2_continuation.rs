@@ -108,3 +108,26 @@ pub async fn worker(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_header_encoding() {
+        let mut b = Vec::new();
+        put_frame(&mut b, FT_CONTINUATION, 0x0, 1, &[0xaa, 0xbb]);
+        // len(3)=2, type=0x9, flags=0, stream_id(4)=1, payload.
+        assert_eq!(b, vec![0, 0, 2, 0x9, 0x0, 0, 0, 0, 1, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn headers_frame_omits_end_headers() {
+        // Reproduce the init HEADERS frame flags byte: must be 0x0 (no
+        // END_HEADERS/END_STREAM) — that's what makes it a CONTINUATION flood.
+        let mut b = Vec::new();
+        put_frame(&mut b, FT_HEADERS, 0x0, 1, &[0x82]);
+        assert_eq!(b[3], FT_HEADERS);
+        assert_eq!(b[4], 0x0, "END_HEADERS/END_STREAM must be unset");
+    }
+}

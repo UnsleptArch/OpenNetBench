@@ -115,6 +115,7 @@ pub async fn worker(
 
         let r = rng.next();
         let n = encode_query(&mut buf, r as u16, r, &domain);
+        debug_assert!(n <= buf.len());
         metrics.requests_sent.fetch_add(1, Relaxed);
         match sock.send(&buf[..n]).await {
             Ok(sent) => {
@@ -125,5 +126,31 @@ pub async fn worker(
                 metrics.errors.fetch_add(1, Relaxed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_query_wire_format() {
+        let mut buf = [0u8; 512];
+        let n = encode_query(&mut buf, 0x1234, 0xABCDEF, "example.com");
+        // Header: id, flags=0x0100 (RD), QDCOUNT=1.
+        assert_eq!(&buf[0..2], &[0x12, 0x34]);
+        assert_eq!(&buf[2..4], &[0x01, 0x00]);
+        assert_eq!(&buf[4..6], &[0x00, 0x01]);
+        // Random 10-char label, then example(7), com(3), root(0).
+        assert_eq!(buf[12], 10);
+        assert_eq!(buf[23], 7);
+        assert_eq!(&buf[24..31], b"example");
+        assert_eq!(buf[31], 3);
+        assert_eq!(&buf[32..35], b"com");
+        assert_eq!(buf[35], 0);
+        // QTYPE=A, QCLASS=IN.
+        assert_eq!(&buf[36..38], &[0, 1]);
+        assert_eq!(&buf[38..40], &[0, 1]);
+        assert_eq!(n, 40);
     }
 }
