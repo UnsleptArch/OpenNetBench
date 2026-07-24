@@ -5,16 +5,24 @@
 //! the collapse curve. Vector workers live in submodules; this module wires
 //! them together and paces them.
 
+mod dns_flood;
+mod h2_rapid_reset;
 mod histogram;
 mod http_flood;
 mod net;
+mod rudy;
 mod slowloris;
+mod syn_flood;
+mod tcp_exhaust;
+mod tls_exhaust;
+mod udp_flood;
 
 use crate::config::{RunConfig, RunMode, Vector};
 use crate::metrics::{LatencySample, RunOutcome, Snapshot};
 use anyhow::Result;
 use histogram::Histogram;
 use net::Target;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -170,7 +178,105 @@ pub async fn run(cfg: &RunConfig) -> Result<()> {
                     )));
                 }
             }
-            other => warn!(vector = other.slug(), "vector not yet implemented — skipping"),
+            Vector::Rudy => {
+                let body_len = plan.tuning.payload_bytes.max(1);
+                let head = net::build_rudy_head(&target.host, &target.path, body_len);
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(rudy::worker(
+                        idx,
+                        target.clone(),
+                        head.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.trickle_interval,
+                    )));
+                }
+            }
+            Vector::TcpExhaust => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(tcp_exhaust::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            Vector::TlsExhaust => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(tls_exhaust::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            Vector::UdpFlood => {
+                let port = if plan.tuning.port > 0 {
+                    plan.tuning.port
+                } else {
+                    target.addr.port()
+                };
+                let dest = SocketAddr::new(target.addr.ip(), port);
+                let payload: Arc<[u8]> = vec![0x41u8; plan.tuning.payload_bytes.max(1)].into();
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(udp_flood::worker(
+                        idx,
+                        dest,
+                        payload.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.rate_per_worker,
+                    )));
+                }
+            }
+            Vector::DnsFlood => {
+                let port = if plan.tuning.port > 0 {
+                    plan.tuning.port
+                } else {
+                    53
+                };
+                let dest = SocketAddr::new(target.addr.ip(), port);
+                let domain: Arc<str> = Arc::from(target.host.as_str());
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(dns_flood::worker(
+                        idx,
+                        dest,
+                        domain.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.rate_per_worker,
+                    )));
+                }
+            }
+            Vector::H2RapidReset => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(h2_rapid_reset::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
+            Vector::SynFlood => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(syn_flood::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
         }
     }
 

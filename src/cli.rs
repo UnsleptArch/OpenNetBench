@@ -7,6 +7,20 @@ use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::time::Duration;
 
+/// Load a run plan from a JSON file (same shape as [`RunConfig`]). The consent
+/// gate is still enforced separately in `main` — config never bypasses it.
+pub fn load_config(path: &std::path::Path) -> Result<RunConfig> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    let cfg: RunConfig = serde_json::from_str(&data).context("parsing config JSON")?;
+    let cfg = RunConfig {
+        target: normalize_target(&cfg.target)?,
+        ..cfg
+    };
+    print_summary(&cfg);
+    Ok(cfg)
+}
+
 pub fn banner() {
     println!("OpenNetBench — single-origin resilience assessment");
     println!("GPLv3 · authorized testing only · all traffic leaves THIS host\n");
