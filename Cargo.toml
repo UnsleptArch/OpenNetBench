@@ -1,0 +1,25 @@
+[package]
+name = "opennetbench"
+version = "0.1.0"
+edition = "2021"
+description = "Single-origin adversarial-load / network resilience assessment tool for authorized testing"
+license = "GPL-3.0-or-later"
+rust-version = "1.96"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
