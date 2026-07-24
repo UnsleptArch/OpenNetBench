@@ -3,6 +3,7 @@
 //! proxy, mode, recon, per-vector tuning, timing, final summary.
 
 use crate::config::{ProxyConfig, RunConfig, RunMode, Vector, VectorPlan, VectorTuning};
+use crate::recon::ReconReport;
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::time::Duration;
@@ -19,6 +20,71 @@ pub fn load_config(path: &std::path::Path) -> Result<RunConfig> {
     };
     print_summary(&cfg);
     Ok(cfg)
+}
+
+/// Print the recon findings for the operator.
+pub fn present_recon(report: &ReconReport) {
+    println!("\n===== recon report =====");
+    println!(
+        "server       : {}",
+        report.server_fingerprint.as_deref().unwrap_or("unknown")
+    );
+    if !report.allowed_methods.is_empty() {
+        println!("methods      : {}", report.allowed_methods.join(", "));
+    }
+    if !report.missing_security_headers.is_empty() {
+        println!("missing hdrs : {}", report.missing_security_headers.join(", "));
+    }
+    if !report.exposed_paths.is_empty() {
+        println!("exposed      :");
+        for p in &report.exposed_paths {
+            println!("  ! {p}");
+        }
+    }
+    println!("ranked endpoints (by asymmetry):");
+    for (i, ep) in report.ranked_endpoints.iter().take(15).enumerate() {
+        println!(
+            "  {:>2}. {:>7.1}  {:>7.1}ms  {}{}  {}",
+            i + 1,
+            ep.asymmetry,
+            ep.baseline_ms,
+            ep.method,
+            if ep.cacheable { " [cached]" } else { "" },
+            ep.url
+        );
+    }
+    println!("========================\n");
+}
+
+/// Choose which endpoint becomes the flood target. In `auto` mode the highest-
+/// asymmetry endpoint is selected without prompting (unattended runs); otherwise
+/// the operator picks, or keeps the original target. Returns the chosen URL, or
+/// `None` to keep the configured target.
+pub fn select_target(report: &ReconReport, auto: bool) -> Option<String> {
+    let top = report.ranked_endpoints.first()?;
+    if auto {
+        return Some(top.url.clone());
+    }
+
+    let mut items: Vec<String> = report
+        .ranked_endpoints
+        .iter()
+        .take(15)
+        .map(|ep| format!("{:>7.1}  {}  {}", ep.asymmetry, ep.method, ep.url))
+        .collect();
+    items.push("(keep original target)".to_string());
+
+    let choice = Select::new()
+        .with_prompt("Approve a flood target")
+        .items(&items)
+        .default(0)
+        .interact()
+        .ok()?;
+    if choice == items.len() - 1 {
+        None
+    } else {
+        Some(report.ranked_endpoints[choice].url.clone())
+    }
 }
 
 pub fn banner() {
@@ -98,6 +164,9 @@ pub fn interactive_flow() -> Result<RunConfig> {
         proxy,
         mode,
         run_recon,
+        // Interactive runs always keep a human in the loop; the unattended
+        // auto-approve path is opt-in via a JSON config file.
+        auto_approve_targets: false,
         vectors,
         duration: Duration::from_secs(duration_s),
         rampup: Duration::from_secs(rampup_s),

@@ -7,6 +7,7 @@
 
 mod ack_flood;
 mod dns_flood;
+mod h2_continuation;
 mod h2_flood;
 mod h2_rapid_reset;
 mod histogram;
@@ -345,6 +346,17 @@ pub async fn run(cfg: &RunConfig) -> Result<()> {
                     )));
                 }
             }
+            Vector::H2Continuation => {
+                for idx in 0..plan.tuning.concurrency {
+                    handles.push(tokio::spawn(h2_continuation::worker(
+                        idx,
+                        target.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+            }
         }
     }
 
@@ -650,6 +662,7 @@ mod tests {
             proxy: None,
             mode: RunMode::Dumb,
             run_recon: false,
+            auto_approve_targets: false,
             vectors: vec![VectorPlan {
                 vector: Vector::HttpFlood,
                 tuning: VectorTuning {

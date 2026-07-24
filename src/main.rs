@@ -58,10 +58,29 @@ async fn main() -> Result<()> {
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
 
-    let cfg = match &args.config {
+    let mut cfg = match &args.config {
         Some(path) => cli::load_config(path)?,
         None => cli::interactive_flow()?,
     };
+
+    // Optional recon: crawl + rank endpoints, then (unless auto-approved) let the
+    // operator pick which becomes the flood target.
+    if cfg.run_recon {
+        info!(target = %cfg.target, "recon: starting");
+        match recon::run_recon(&cfg.target).await {
+            Ok(report) => {
+                cli::present_recon(&report);
+                match cli::select_target(&report, cfg.auto_approve_targets) {
+                    Some(url) => {
+                        info!(target = %url, auto = cfg.auto_approve_targets, "recon: target selected");
+                        cfg.target = url;
+                    }
+                    None => info!("recon: keeping original target"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "recon failed — continuing with original target"),
+        }
+    }
 
     // Final go/no-go before generating any traffic.
     if !dialoguer::Confirm::new()

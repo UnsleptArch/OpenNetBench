@@ -26,6 +26,7 @@ h2 = "0.4"
 http = "1"
 pnet_packet = "0.35"
 pnet_transport = "0.35"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 
 [profile.release]
 opt-level = 3

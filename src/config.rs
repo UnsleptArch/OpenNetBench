@@ -48,10 +48,13 @@ pub enum Vector {
     AckFlood,
     /// L3 — ICMP echo flood via raw socket (requires root).
     IcmpFlood,
+    /// L7 — CVE-2024-27316 HTTP/2 CONTINUATION flood: endless CONTINUATION
+    /// frames without END_HEADERS force unbounded header-buffer growth.
+    H2Continuation,
 }
 
 impl Vector {
-    pub const ALL: [Vector; 15] = [
+    pub const ALL: [Vector; 16] = [
         Vector::HttpFlood,
         Vector::HttpsOnly,
         Vector::H2RapidReset,
@@ -67,6 +70,7 @@ impl Vector {
         Vector::H2Flood,
         Vector::AckFlood,
         Vector::IcmpFlood,
+        Vector::H2Continuation,
     ];
 
     pub fn slug(self) -> &'static str {
@@ -86,6 +90,7 @@ impl Vector {
             Vector::H2Flood => "h2_flood",
             Vector::AckFlood => "ack_flood",
             Vector::IcmpFlood => "icmp_flood",
+            Vector::H2Continuation => "h2_continuation",
         }
     }
 
@@ -126,6 +131,7 @@ impl Vector {
             Vector::H2Flood => "Multiplexed HTTP/2 request flood over one connection",
             Vector::AckFlood => "TCP ACK flood via raw socket — stresses firewall/conntrack",
             Vector::IcmpFlood => "ICMP echo flood via raw socket (requires root)",
+            Vector::H2Continuation => "CVE-2024-27316 HTTP/2 CONTINUATION flood — unbounded header buffer",
         }
     }
 }
@@ -238,6 +244,11 @@ pub struct RunConfig {
     pub proxy: Option<ProxyConfig>,
     pub mode: RunMode,
     pub run_recon: bool,
+    /// Opt out of human target approval. When true, recon auto-selects the
+    /// highest-asymmetry endpoint and the run proceeds unattended — intended for
+    /// long (multi-day) authorized soak tests. Default false (human approves).
+    #[serde(default)]
+    pub auto_approve_targets: bool,
     pub vectors: Vec<VectorPlan>,
     #[serde(with = "duration_secs")]
     pub duration: Duration,
