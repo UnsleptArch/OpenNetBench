@@ -23,6 +23,7 @@ mod tcp_exhaust;
 mod tls_exhaust;
 mod udp_flood;
 
+use crate::classify::{self, RunContext, Signals};
 use crate::config::{RunConfig, RunMode, Vector};
 use crate::metrics::{LatencySample, RunOutcome, Snapshot};
 use anyhow::Result;
@@ -45,6 +46,14 @@ pub struct Metrics {
     pub errors: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub held_connections: AtomicU32,
+    // L7 status distribution (set by http/range/h2 workers) — the classifier's
+    // primary application-layer signal.
+    pub http_2xx: AtomicU64,
+    pub http_3xx: AtomicU64,
+    pub http_4xx: AtomicU64,
+    pub http_403: AtomicU64,
+    pub http_429: AtomicU64,
+    pub http_5xx: AtomicU64,
     hist: Histogram,
 }
 
@@ -56,6 +65,12 @@ impl Metrics {
             errors: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             held_connections: AtomicU32::new(0),
+            http_2xx: AtomicU64::new(0),
+            http_3xx: AtomicU64::new(0),
+            http_4xx: AtomicU64::new(0),
+            http_403: AtomicU64::new(0),
+            http_429: AtomicU64::new(0),
+            http_5xx: AtomicU64::new(0),
             hist: Histogram::new(),
         }
     }
@@ -64,6 +79,21 @@ impl Metrics {
     #[inline]
     pub fn record_latency(&self, d: Duration) {
         self.hist.record_us(d.as_micros() as u64);
+    }
+
+    /// Record an observed HTTP status code into the class buckets.
+    #[inline]
+    pub fn record_status(&self, code: u16) {
+        let c = match code {
+            200..=299 => &self.http_2xx,
+            300..=399 => &self.http_3xx,
+            403 => &self.http_403,
+            429 => &self.http_429,
+            400..=499 => &self.http_4xx,
+            500..=599 => &self.http_5xx,
+            _ => return,
+        };
+        c.fetch_add(1, Relaxed);
     }
 }
 
@@ -127,8 +157,9 @@ impl Governor {
     }
 }
 
-/// Drive a full run to completion (or until Ctrl-C).
-pub async fn run(cfg: &RunConfig) -> Result<()> {
+/// Drive a full run to completion (or until Ctrl-C). `ctx` carries recon-derived
+/// baseline/WAF hints; pass `RunContext::default()` when recon didn't run.
+pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
     let target = Arc::new(Target::resolve(&cfg.target).await?);
     info!(addr = %target.addr, tls = target.tls, "engine: target resolved");
 
@@ -383,8 +414,39 @@ pub async fn run(cfg: &RunConfig) -> Result<()> {
     }
     let _ = sampler.await;
 
-    let outcome = derive_outcome(&samples.lock().unwrap());
+    let samples = samples.lock().unwrap();
+    let outcome = derive_outcome(&samples, ctx.baseline_ms);
     log_summary(&metrics, &outcome, start.elapsed());
+
+    let l7_active = cfg.vectors.iter().any(|p| {
+        matches!(
+            p.vector,
+            Vector::HttpFlood | Vector::HttpsOnly | Vector::RangeFlood | Vector::H2Flood
+        )
+    });
+    let signals = Signals {
+        requests: metrics.requests_sent.load(Relaxed),
+        errors: metrics.errors.load(Relaxed),
+        http_2xx: metrics.http_2xx.load(Relaxed),
+        http_3xx: metrics.http_3xx.load(Relaxed),
+        http_4xx: metrics.http_4xx.load(Relaxed),
+        http_403: metrics.http_403.load(Relaxed),
+        http_429: metrics.http_429.load(Relaxed),
+        http_5xx: metrics.http_5xx.load(Relaxed),
+        baseline_ms: ctx.baseline_ms,
+        waf_vendor: ctx.waf_vendor.clone(),
+        l7_active,
+    };
+    let verdict = classify::classify(&signals, &samples);
+    info!(
+        verdict = verdict.verdict.label(),
+        confidence = verdict.confidence,
+        finding = verdict.verdict.is_finding(),
+        "classification"
+    );
+    for e in &verdict.evidence {
+        info!(evidence = %e);
+    }
     Ok(())
 }
 
@@ -529,12 +591,16 @@ async fn sample(
 /// Post-process the collapse curve into the headline metrics. Best-effort:
 /// baseline is the earliest low-error latency; degradation is a sustained 3×
 /// breach; recovery is p99 returning within 1.5× baseline afterwards.
-fn derive_outcome(samples: &[LatencySample]) -> RunOutcome {
+fn derive_outcome(samples: &[LatencySample], recon_baseline: Option<f64>) -> RunOutcome {
     let mut o = RunOutcome::default();
-    let baseline = samples
-        .iter()
-        .find(|s| s.error_rate < 0.1 && s.p99_ms > 0.0)
-        .map(|s| s.p99_ms);
+    // Prefer the recon pre-load baseline; fall back to the earliest low-error
+    // sample when recon didn't run.
+    let baseline = recon_baseline.or_else(|| {
+        samples
+            .iter()
+            .find(|s| s.error_rate < 0.1 && s.p99_ms > 0.0)
+            .map(|s| s.p99_ms)
+    });
     o.baseline_p99_ms = baseline;
     let Some(base) = baseline else { return o };
 
@@ -542,7 +608,9 @@ fn derive_outcome(samples: &[LatencySample]) -> RunOutcome {
     for s in samples {
         match degraded_at {
             None => {
-                if s.p99_ms > base * 3.0 {
+                if s.p99_ms > base * 3.0
+                    && s.p99_ms - base > classify::MIN_DEGRADE_DELTA_MS
+                {
                     degraded_at = Some(s.t_ms);
                     o.time_to_degradation_ms = Some(s.t_ms);
                     o.knee_concurrency = Some(s.concurrency);
@@ -677,7 +745,7 @@ mod tests {
             rampup: Duration::from_millis(50),
         };
 
-        run(&cfg).await.unwrap();
+        run(&cfg, RunContext::default()).await.unwrap();
         assert!(
             hits.load(Relaxed) > 0,
             "server received no requests — engine produced no traffic"

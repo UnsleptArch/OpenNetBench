@@ -87,6 +87,7 @@ pub async fn worker(
             match resp_fut.await {
                 Ok(resp) => {
                     metrics.record_latency(t0.elapsed());
+                    metrics.record_status(resp.status().as_u16());
                     metrics.responses_ok.fetch_add(1, Relaxed);
                     // Drain the body, returning flow-control capacity as we go.
                     let mut body = resp.into_body();

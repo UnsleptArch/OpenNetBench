@@ -141,6 +141,7 @@ async fn one_request(
                     1 => !conn_close,
                     _ => conn_keep,
                 };
+                metrics.record_status(resp.code.unwrap_or(0));
                 break (content_len, chunked, hdr_end, keep_alive);
             }
             Ok(httparse::Status::Partial) => {

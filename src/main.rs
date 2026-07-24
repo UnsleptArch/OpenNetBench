@@ -64,19 +64,31 @@ async fn main() -> Result<()> {
     };
 
     // Optional recon: crawl + rank endpoints, then (unless auto-approved) let the
-    // operator pick which becomes the flood target.
+    // operator pick which becomes the flood target. Recon also seeds the
+    // classifier's baseline latency and WAF fingerprint.
+    let mut ctx = classify::RunContext::default();
     if cfg.run_recon {
         info!(target = %cfg.target, "recon: starting");
         match recon::run_recon(&cfg.target).await {
             Ok(report) => {
                 cli::present_recon(&report);
-                match cli::select_target(&report, cfg.auto_approve_targets) {
+                ctx.waf_vendor = classify::detect_waf(report.server_fingerprint.as_deref());
+                let chosen = match cli::select_target(&report, cfg.auto_approve_targets) {
                     Some(url) => {
                         info!(target = %url, auto = cfg.auto_approve_targets, "recon: target selected");
-                        cfg.target = url;
+                        cfg.target = url.clone();
+                        url
                     }
-                    None => info!("recon: keeping original target"),
-                }
+                    None => {
+                        info!("recon: keeping original target");
+                        cfg.target.clone()
+                    }
+                };
+                ctx.baseline_ms = report
+                    .ranked_endpoints
+                    .iter()
+                    .find(|e| e.url == chosen)
+                    .map(|e| e.baseline_ms);
             }
             Err(e) => tracing::warn!(error = %e, "recon failed — continuing with original target"),
         }
@@ -94,7 +106,7 @@ async fn main() -> Result<()> {
     }
 
     info!(run_id, log = %log_path.display(), "run authorized — handing to engine");
-    engine::run(&cfg).await?;
+    engine::run(&cfg, ctx).await?;
 
     info!("run complete");
     Ok(())
