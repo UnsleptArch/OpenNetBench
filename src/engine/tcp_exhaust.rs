@@ -34,16 +34,25 @@ pub async fn worker(
             continue;
         }
 
-        let mut stream = match TcpStream::connect(target.addr).await {
-            Ok(s) => s,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                tokio::select! {
-                    _ = down.changed() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        // Connect must be cancellable AND bounded: a bare TcpStream::connect to
+        // an overwhelmed host blocks on the OS SYN timeout (~20s), which was the
+        // cause of the multi-second shutdown drain. Cap it and race it against
+        // the stop signal.
+        let mut stream = tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target.addr)) => {
+                match r {
+                    Ok(Ok(s)) => s,
+                    _ => {
+                        metrics.errors.fetch_add(1, Relaxed);
+                        tokio::select! {
+                            _ = down.changed() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
+                        continue;
+                    }
                 }
-                continue;
             }
+            _ = down.changed() => return,
         };
         let _held = HeldGuard::new(&metrics.held_connections);
         metrics.requests_sent.fetch_add(1, Relaxed);

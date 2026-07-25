@@ -16,12 +16,14 @@ mod db;
 mod engine;
 mod logging;
 mod metrics;
+mod presets;
 mod recon;
 mod web;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::Parser;
+use config::Tier;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -34,6 +36,35 @@ struct Args {
     /// Consent is still required; only the plan questions are skipped.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Use a built-in preset combo (see --list-presets). Requires --target.
+    #[arg(long, value_name = "NAME")]
+    preset: Option<String>,
+
+    /// Aggressiveness tier for a preset: recon|light|moderate|aggressive|brutal.
+    #[arg(long, default_value = "moderate")]
+    tier: String,
+
+    /// Target URL or IP (bare IPs get http:// assumed for presets).
+    #[arg(long)]
+    target: Option<String>,
+
+    /// Run duration in seconds (preset mode). 0 = until stopped.
+    #[arg(long, default_value_t = 60)]
+    duration: u64,
+
+    /// Ramp-up in seconds (preset mode).
+    #[arg(long, default_value_t = 10)]
+    rampup: u64,
+
+    /// List available presets and tiers, then exit.
+    #[arg(long)]
+    list_presets: bool,
+
+    /// Write the resolved plan to a JSON file and exit (no consent, no run).
+    /// Combine with --preset to generate an editable config.
+    #[arg(long, value_name = "FILE")]
+    save_config: Option<PathBuf>,
 
     /// Serve the dashboard UI over existing run history and exit (no run).
     #[arg(long)]
@@ -49,18 +80,47 @@ async fn main() -> Result<()> {
 
     cli::banner();
 
+    if args.list_presets {
+        print_presets();
+        return Ok(());
+    }
+
     if args.ui_only {
         info!("serving dashboard only (no assessment run)");
         return web::serve(web::DEFAULT_BIND).await;
+    }
+
+    // Build the plan from a preset if requested (before consent, so --save-config
+    // works as a non-running generator).
+    let preset_cfg = match &args.preset {
+        Some(name) => Some(build_preset_config(&args, name)?),
+        None => None,
+    };
+
+    // --save-config: dump the resolved plan (preset or loaded config) and exit.
+    if let Some(path) = &args.save_config {
+        let cfg = match (preset_cfg, &args.config) {
+            (Some(cfg), _) => cfg,
+            (None, Some(cfgpath)) => cli::load_config(cfgpath)?,
+            (None, None) => return Err(anyhow!("--save-config needs --preset or --config")),
+        };
+        std::fs::write(path, serde_json::to_string_pretty(&cfg)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("Wrote plan to {} — edit and run with --config.", path.display());
+        return Ok(());
     }
 
     // Legal notice + mandatory consent gate — always, before anything else.
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
 
-    let mut cfg = match &args.config {
-        Some(path) => cli::load_config(path)?,
-        None => cli::interactive_flow()?,
+    let mut cfg = match (preset_cfg, &args.config) {
+        (Some(cfg), _) => {
+            cli::print_summary(&cfg);
+            cfg
+        }
+        (None, Some(path)) => cli::load_config(path)?,
+        (None, None) => cli::interactive_flow()?,
     };
 
     // Optional recon: crawl + rank endpoints, then (unless auto-approved) let the
@@ -110,4 +170,43 @@ async fn main() -> Result<()> {
 
     info!("run complete");
     Ok(())
+}
+
+/// Resolve --preset/--tier/--target into a runnable config.
+fn build_preset_config(args: &Args, name: &str) -> Result<config::RunConfig> {
+    let preset = presets::find(name)
+        .ok_or_else(|| anyhow!("unknown preset '{name}' — see --list-presets"))?;
+    let tier = Tier::parse(&args.tier)
+        .ok_or_else(|| anyhow!("unknown tier '{}' — see --list-presets", args.tier))?;
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("--preset requires --target"))?;
+    let target = cli::normalize_target(target)?;
+    if preset.needs_root {
+        eprintln!("note: preset '{}' uses raw-socket vectors — run with sudo.", preset.name);
+    }
+    Ok(presets::build_config(
+        preset,
+        tier,
+        target,
+        None,
+        std::time::Duration::from_secs(args.duration),
+        std::time::Duration::from_secs(args.rampup),
+    ))
+}
+
+fn print_presets() {
+    println!("Presets (use --preset <name> --target <url|ip> [--tier <tier>]):\n");
+    for p in presets::PRESETS {
+        let sudo = if p.needs_root { "  [sudo]" } else { "" };
+        println!("  {:<12} {}{}", p.name, p.description, sudo);
+    }
+    println!("\nTiers (--tier):\n");
+    for t in Tier::ALL {
+        println!("  {:<12} {}", t.slug(), t.description());
+    }
+    println!("\nExample:");
+    println!("  sudo ./opennetbench --preset router --tier aggressive --target 192.168.1.254 --duration 40");
+    println!("  ./opennetbench --preset web --tier moderate --target https://example.com --save-config web.json");
 }

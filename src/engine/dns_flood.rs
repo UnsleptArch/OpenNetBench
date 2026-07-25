@@ -124,6 +124,8 @@ pub async fn worker(
             }
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);
+                // Avoid a hot spin against a closed/unreachable UDP:53.
+                tokio::time::sleep(Duration::from_micros(200)).await;
             }
         }
     }

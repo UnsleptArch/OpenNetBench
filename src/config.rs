@@ -158,6 +158,65 @@ impl RunMode {
     }
 }
 
+/// Aggressiveness tier — scales how much load a preset generates. `Recon` runs
+/// no flood at all (probe/recon only); the rest set a per-vector base
+/// concurrency the preset applies to every vector it selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    /// No flood — recon + health probe only. Safe first pass.
+    Recon,
+    Light,
+    Moderate,
+    Aggressive,
+    Brutal,
+}
+
+impl Tier {
+    pub const ALL: [Tier; 5] = [
+        Tier::Recon,
+        Tier::Light,
+        Tier::Moderate,
+        Tier::Aggressive,
+        Tier::Brutal,
+    ];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Tier::Recon => "recon",
+            Tier::Light => "light",
+            Tier::Moderate => "moderate",
+            Tier::Aggressive => "aggressive",
+            Tier::Brutal => "brutal",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Tier> {
+        Tier::ALL.into_iter().find(|t| t.slug() == s.to_ascii_lowercase())
+    }
+
+    /// Base per-vector concurrency this tier applies. `Recon` is 0 (no flood).
+    pub fn concurrency(self) -> u32 {
+        match self {
+            Tier::Recon => 0,
+            Tier::Light => 50,
+            Tier::Moderate => 200,
+            Tier::Aggressive => 800,
+            Tier::Brutal => 3000,
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Tier::Recon => "no flood — recon + health probe only",
+            Tier::Light => "gentle (50/vector) — smoke test",
+            Tier::Moderate => "default (200/vector)",
+            Tier::Aggressive => "heavy (800/vector)",
+            Tier::Brutal => "max single-origin pressure (3000/vector)",
+        }
+    }
+}
+
 /// Per-vector tuning knobs. Not every field applies to every vector; the
 /// engine reads only the fields relevant to the vector it's driving. Defaults
 /// are deliberately conservative — the operator scales up explicitly.

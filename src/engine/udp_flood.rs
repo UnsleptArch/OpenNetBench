@@ -67,6 +67,10 @@ pub async fn worker(
             }
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);
+                // A closed/unreachable UDP port returns ECONNREFUSED instantly;
+                // without a tiny backoff this spins millions of failing syscalls
+                // per second, burning CPU for nothing.
+                tokio::time::sleep(Duration::from_micros(200)).await;
             }
         }
     }

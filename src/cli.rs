@@ -217,17 +217,23 @@ fn tune_vector(v: Vector) -> Result<VectorTuning> {
     Ok(tuning)
 }
 
-fn normalize_target(raw: &str) -> Result<String> {
+pub fn normalize_target(raw: &str) -> Result<String> {
     let candidate = if raw.contains("://") {
         raw.to_string()
     } else {
-        format!("https://{raw}")
+        // Bare IPs default to http (router/admin UIs are usually plaintext, and
+        // L4 vectors just need address:port); hostnames default to https.
+        let host_part = raw.split('/').next().unwrap_or(raw);
+        let host_only = host_part.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_part);
+        let is_ip = host_only.parse::<std::net::IpAddr>().is_ok();
+        let scheme = if is_ip { "http" } else { "https" };
+        format!("{scheme}://{raw}")
     };
     url::Url::parse(&candidate).with_context(|| format!("invalid target URL: {raw}"))?;
     Ok(candidate)
 }
 
-fn print_summary(cfg: &RunConfig) {
+pub fn print_summary(cfg: &RunConfig) {
     println!("\n===== run plan =====");
     println!("target   : {}", cfg.target);
     println!(
