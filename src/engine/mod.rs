@@ -165,8 +165,14 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
 
     let metrics = Arc::new(Metrics::new());
     let shutdown = Shutdown::new();
+    // Ground-truth health probe: baseline the target's connect latency BEFORE
+    // load starts, so we can tell whether the run actually affected it.
+    let probe_baseline_ms = probe_baseline(target.addr).await;
+    info!(baseline_ms = ?probe_baseline_ms, "health probe: baseline");
+
     let start = Instant::now();
     let samples: Arc<Mutex<Vec<LatencySample>>> = Arc::new(Mutex::new(Vec::with_capacity(1024)));
+    let probe_points: Arc<Mutex<Vec<(u64, Option<f64>)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -403,6 +409,13 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         samples.clone(),
         start,
     ));
+    // Independent health probe: checks the target's reachability during the run.
+    let prober = tokio::spawn(health_probe(
+        target.addr,
+        shutdown.clone(),
+        probe_points.clone(),
+        start,
+    ));
 
     info!("engine live — Ctrl-C to stop");
     wait_for_stop(cfg.duration, shutdown.clone()).await;
@@ -413,10 +426,29 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         let _ = h.await;
     }
     let _ = sampler.await;
+    let _ = prober.await;
 
     let samples = samples.lock().unwrap();
     let outcome = derive_outcome(&samples, ctx.baseline_ms);
     log_summary(&metrics, &outcome, start.elapsed());
+
+    // Reduce the health-probe timeline to peak latency + failure counts.
+    let pts = probe_points.lock().unwrap();
+    let probe_total = pts.len() as u32;
+    let probe_failures = pts.iter().filter(|(_, ms)| ms.is_none()).count() as u32;
+    let probe_peak_ms = pts
+        .iter()
+        .filter_map(|(_, ms)| *ms)
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))));
+    let peak_held = samples.iter().map(|s| s.concurrency).max().unwrap_or(0);
+    info!(
+        peak_held_connections = peak_held,
+        bytes_sent = metrics.bytes_sent.load(Relaxed),
+        probe_checks = probe_total,
+        probe_failures,
+        probe_peak_ms = ?probe_peak_ms,
+        "target-side"
+    );
 
     let l7_active = cfg.vectors.iter().any(|p| {
         matches!(
@@ -436,6 +468,11 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         baseline_ms: ctx.baseline_ms,
         waf_vendor: ctx.waf_vendor.clone(),
         l7_active,
+        probe_baseline_ms,
+        probe_peak_ms,
+        probe_failures,
+        probe_total,
+        peak_held,
     };
     let verdict = classify::classify(&signals, &samples);
     info!(
@@ -448,6 +485,52 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         info!(evidence = %e);
     }
     Ok(())
+}
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One TCP connect to the target: connect time in ms, or `None` on failure.
+/// This is the independent, ground-truth measure of whether the target is still
+/// accepting connections (and how fast) while under load — it works for every
+/// vector, including L4/raw ones that produce no application-layer signal.
+async fn probe_once(addr: SocketAddr) -> Option<f64> {
+    let t0 = Instant::now();
+    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_stream)) => Some(t0.elapsed().as_secs_f64() * 1000.0),
+        _ => None, // timeout or refused = the target is not healthily accepting
+    }
+}
+
+/// Average connect latency over a few probes, measured before load starts.
+async fn probe_baseline(addr: SocketAddr) -> Option<f64> {
+    let mut total = 0.0;
+    let mut n = 0u32;
+    for _ in 0..3 {
+        if let Some(ms) = probe_once(addr).await {
+            total += ms;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| total / n as f64)
+}
+
+/// Periodic health probe for the duration of the run.
+async fn health_probe(
+    addr: SocketAddr,
+    shutdown: Arc<Shutdown>,
+    out: Arc<Mutex<Vec<(u64, Option<f64>)>>>,
+    start: Instant,
+) {
+    let mut down = shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            _ = down.changed() => return,
+        }
+        let ms = probe_once(addr).await;
+        out.lock().unwrap().push((start.elapsed().as_millis() as u64, ms));
+    }
 }
 
 /// Resolve when either the duration elapses or Ctrl-C is received. A duration of

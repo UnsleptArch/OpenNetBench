@@ -83,6 +83,17 @@ pub struct Signals {
     pub waf_vendor: Option<String>,
     /// Whether any L7 vector that yields HTTP status codes actually ran.
     pub l7_active: bool,
+    // Independent health-probe signal (works for any vector, incl. L4/raw).
+    /// Connect latency (ms) before load started.
+    pub probe_baseline_ms: Option<f64>,
+    /// Worst connect latency (ms) observed during the run.
+    pub probe_peak_ms: Option<f64>,
+    /// Number of health probes that failed (timeout/refused).
+    pub probe_failures: u32,
+    /// Total health probes attempted.
+    pub probe_total: u32,
+    /// Peak concurrent held connections observed.
+    pub peak_held: u32,
 }
 
 /// Known WAF/CDN vendor substrings to look for in a `Server` header.
@@ -113,12 +124,56 @@ pub fn detect_waf(server: Option<&str>) -> Option<String> {
 pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     let mut ev = Vec::new();
 
+    // 0. Health probe — independent ground truth about the target's availability.
+    // This is the only signal that works for L4/raw vectors, and it overrides the
+    // rest when it shows real impact.
+    if sig.probe_total > 0 {
+        if let Some(base) = sig.probe_baseline_ms {
+            let fail_frac = sig.probe_failures as f64 / sig.probe_total as f64;
+            let peak = sig.probe_peak_ms.unwrap_or(base);
+            if fail_frac > 0.3 {
+                ev.push(format!(
+                    "health probe: {:.0}% of connection checks to the target FAILED under load",
+                    fail_frac * 100.0
+                ));
+                let verdict = if fail_frac > 0.7 { Verdict::Down } else { Verdict::Degrading };
+                return Classification {
+                    verdict,
+                    confidence: (0.6 + fail_frac * 0.3).min(0.9),
+                    evidence: ev,
+                };
+            }
+            if base > 0.0 && peak > base * 3.0 && peak - base > MIN_DEGRADE_DELTA_MS {
+                ev.push(format!(
+                    "health probe connect latency rose {base:.1}ms → {peak:.1}ms under load ({:.1}x)",
+                    peak / base
+                ));
+                return Classification {
+                    verdict: Verdict::Degrading,
+                    confidence: 0.8,
+                    evidence: ev,
+                };
+            }
+            ev.push(format!(
+                "health probe stable ({base:.1}ms baseline, {}/{} checks ok)",
+                sig.probe_total - sig.probe_failures,
+                sig.probe_total
+            ));
+        }
+    }
+
     if !sig.l7_active {
-        return Classification {
-            verdict: Verdict::Unknown,
-            confidence: 0.0,
-            evidence: vec!["L4/raw vectors only — no application-layer verdict".into()],
-        };
+        // No application-layer signal — lean on the health probe. A stable probe
+        // means the target absorbed the load; no probe at all means we can't tell.
+        if sig.probe_total > 0 && sig.probe_baseline_ms.is_some() {
+            ev.push(format!(
+                "target kept accepting connections (peak {} concurrent held) — absorbed",
+                sig.peak_held
+            ));
+            return Classification { verdict: Verdict::Healthy, confidence: 0.6, evidence: ev };
+        }
+        ev.push("L4/raw vectors only and no health-probe signal — can't assess".into());
+        return Classification { verdict: Verdict::Unknown, confidence: 0.0, evidence: ev };
     }
 
     let responses =
@@ -268,6 +323,11 @@ mod tests {
             baseline_ms: Some(10.0),
             waf_vendor: None,
             l7_active: true,
+            probe_baseline_ms: None,
+            probe_peak_ms: None,
+            probe_failures: 0,
+            probe_total: 0,
+            peak_held: 0,
         }
     }
 
@@ -330,6 +390,46 @@ mod tests {
         s.http_5xx = 10;
         let samples = [sample(10.0, 0.0), sample(12.0, 0.0)];
         assert_eq!(classify(&s, &samples).verdict, Verdict::Healthy);
+    }
+
+    #[test]
+    fn probe_failures_mean_down_even_for_l4() {
+        let mut s = base_signals();
+        s.l7_active = false; // e.g. a tcp_exhaust / syn_flood run
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_total = 10;
+        s.probe_failures = 9;
+        assert_eq!(classify(&s, &[]).verdict, Verdict::Down);
+    }
+
+    #[test]
+    fn l4_absorbed_is_healthy_not_unknown() {
+        let mut s = base_signals();
+        s.l7_active = false;
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_peak_ms = Some(6.0);
+        s.probe_total = 10;
+        s.probe_failures = 0;
+        s.peak_held = 500;
+        let c = classify(&s, &[]);
+        assert_eq!(c.verdict, Verdict::Healthy);
+    }
+
+    #[test]
+    fn l4_without_probe_is_unknown() {
+        let mut s = base_signals();
+        s.l7_active = false;
+        assert_eq!(classify(&s, &[]).verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn probe_latency_blowout_is_degrading() {
+        let mut s = base_signals();
+        s.l7_active = false;
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_peak_ms = Some(200.0); // 40x, +195ms
+        s.probe_total = 10;
+        assert_eq!(classify(&s, &[]).verdict, Verdict::Degrading);
     }
 
     #[test]
