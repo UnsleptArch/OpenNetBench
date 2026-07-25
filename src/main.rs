@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod auth;
+mod auto;
 mod classify;
 mod cli;
 mod config;
@@ -36,6 +37,11 @@ struct Args {
     /// Consent is still required; only the plan questions are skipped.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Auto-engine: probe --target, characterize it, recommend a preset + tier,
+    /// then run it (after the normal consent + confirm).
+    #[arg(long)]
+    auto: bool,
 
     /// Use a built-in preset combo (see --list-presets). Requires --target.
     #[arg(long, value_name = "NAME")]
@@ -114,13 +120,38 @@ async fn main() -> Result<()> {
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
 
-    let mut cfg = match (preset_cfg, &args.config) {
-        (Some(cfg), _) => {
-            cli::print_summary(&cfg);
-            cfg
+    let mut cfg = if args.auto {
+        // Probe the target (traffic), so this happens after consent.
+        let target = args
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow!("--auto requires --target"))?;
+        let target = cli::normalize_target(target)?;
+        info!(target = %target, "auto-engine: probing target");
+        let c = auto::characterize(&target).await;
+        auto::print_characterization(&c);
+        let rec = auto::recommend(&c, is_root());
+        auto::print_recommendation(&rec);
+        let preset = presets::find(rec.preset).expect("recommended preset must exist");
+        let cfg = presets::build_config(
+            preset,
+            rec.tier,
+            target,
+            None,
+            std::time::Duration::from_secs(args.duration),
+            std::time::Duration::from_secs(args.rampup),
+        );
+        cli::print_summary(&cfg);
+        cfg
+    } else {
+        match (preset_cfg, &args.config) {
+            (Some(cfg), _) => {
+                cli::print_summary(&cfg);
+                cfg
+            }
+            (None, Some(path)) => cli::load_config(path)?,
+            (None, None) => cli::interactive_flow()?,
         }
-        (None, Some(path)) => cli::load_config(path)?,
-        (None, None) => cli::interactive_flow()?,
     };
 
     // Optional recon: crawl + rank endpoints, then (unless auto-approved) let the
@@ -194,6 +225,23 @@ fn build_preset_config(args: &Args, name: &str) -> Result<config::RunConfig> {
         std::time::Duration::from_secs(args.duration),
         std::time::Duration::from_secs(args.rampup),
     ))
+}
+
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn geteuid() -> u32;
 }
 
 fn print_presets() {
