@@ -1,6 +1,6 @@
 [package]
 name = "opennetbench"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 description = "Single-origin adversarial-load / network resilience assessment tool for authorized testing"
 license = "GPL-3.0-or-later"
