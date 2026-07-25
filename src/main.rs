@@ -43,6 +43,16 @@ struct Args {
     #[arg(long)]
     auto: bool,
 
+    /// Let recon auto-select the highest-asymmetry target (no approval prompt).
+    #[arg(long)]
+    auto_approve: bool,
+
+    /// Watch the target during the run; when a finding is detected (target down
+    /// or degrading), pause and ask whether to stop. Off by default: the run
+    /// always goes the full duration unless you enable this.
+    #[arg(long)]
+    stop_on_detect: bool,
+
     /// Use a built-in preset combo (see --list-presets). Requires --target.
     #[arg(long, value_name = "NAME")]
     preset: Option<String>,
@@ -120,6 +130,10 @@ async fn main() -> Result<()> {
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
 
+    // Base from flags; the interactive flow may override with y/n answers.
+    let mut auto_approve = args.auto_approve;
+    let mut stop_on_detect = args.stop_on_detect;
+
     let mut cfg = if args.auto {
         // Probe the target (traffic), so this happens after consent.
         let target = args
@@ -150,23 +164,31 @@ async fn main() -> Result<()> {
                 cfg
             }
             (None, Some(path)) => cli::load_config(path)?,
-            (None, None) => cli::interactive_flow()?,
+            (None, None) => {
+                let plan = cli::interactive_flow()?;
+                auto_approve = plan.auto_approve;
+                stop_on_detect = plan.stop_on_detect;
+                plan.cfg
+            }
         }
     };
 
     // Optional recon: crawl + rank endpoints, then (unless auto-approved) let the
     // operator pick which becomes the flood target. Recon also seeds the
     // classifier's baseline latency and WAF fingerprint.
-    let mut ctx = classify::RunContext::default();
+    let mut ctx = classify::RunContext {
+        stop_on_detect,
+        ..Default::default()
+    };
     if cfg.run_recon {
         info!(target = %cfg.target, "recon: starting");
         match recon::run_recon(&cfg.target).await {
             Ok(report) => {
                 cli::present_recon(&report);
                 ctx.waf_vendor = classify::detect_waf(report.server_fingerprint.as_deref());
-                let chosen = match cli::select_target(&report, cfg.auto_approve_targets) {
+                let chosen = match cli::select_target(&report, auto_approve) {
                     Some(url) => {
-                        info!(target = %url, auto = cfg.auto_approve_targets, "recon: target selected");
+                        info!(target = %url, auto = auto_approve, "recon: target selected");
                         cfg.target = url.clone();
                         url
                     }

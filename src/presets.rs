@@ -110,7 +110,6 @@ pub fn build_config(
         mode: preset.mode,
         // Recon tier is recon-only; otherwise honor the preset's choice.
         run_recon: preset.run_recon || tier == Tier::Recon,
-        auto_approve_targets: false,
         vectors,
         duration,
         rampup,

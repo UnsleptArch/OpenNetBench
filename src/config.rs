@@ -303,11 +303,6 @@ pub struct RunConfig {
     pub proxy: Option<ProxyConfig>,
     pub mode: RunMode,
     pub run_recon: bool,
-    /// Opt out of human target approval. When true, recon auto-selects the
-    /// highest-asymmetry endpoint and the run proceeds unattended — intended for
-    /// long (multi-day) authorized soak tests. Default false (human approves).
-    #[serde(default)]
-    pub auto_approve_targets: bool,
     pub vectors: Vec<VectorPlan>,
     #[serde(with = "duration_secs")]
     pub duration: Duration,

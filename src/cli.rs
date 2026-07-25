@@ -92,8 +92,16 @@ pub fn banner() {
     println!("GPLv3 · authorized testing only · all traffic leaves THIS host\n");
 }
 
+/// The interactive plan plus the two run options that aren't part of the saved
+/// config (they're flags for scripted runs, y/n prompts here).
+pub struct InteractivePlan {
+    pub cfg: RunConfig,
+    pub auto_approve: bool,
+    pub stop_on_detect: bool,
+}
+
 /// Build a run plan through interactive prompts.
-pub fn interactive_flow() -> Result<RunConfig> {
+pub fn interactive_flow() -> Result<InteractivePlan> {
     // Target ----------------------------------------------------------------
     let target: String = Input::new()
         .with_prompt("Target URL")
@@ -130,6 +138,23 @@ pub fn interactive_flow() -> Result<RunConfig> {
         .default(true)
         .interact()?;
 
+    // Auto-approve: only meaningful if recon runs and picks a target for you.
+    let auto_approve = if run_recon {
+        Confirm::new()
+            .with_prompt("Auto-approve recon's top-ranked target (skip the pick prompt)?")
+            .default(false)
+            .interact()?
+    } else {
+        false
+    };
+
+    // Stop-on-detect: off = run the full duration; on = prompt to stop the
+    // moment a finding is detected.
+    let stop_on_detect = Confirm::new()
+        .with_prompt("Stop and ask when a finding is detected? (No = run the full duration)")
+        .default(false)
+        .interact()?;
+
     // Vector selection ------------------------------------------------------
     let labels: Vec<String> = Vector::ALL
         .iter()
@@ -164,16 +189,17 @@ pub fn interactive_flow() -> Result<RunConfig> {
         proxy,
         mode,
         run_recon,
-        // Interactive runs always keep a human in the loop; the unattended
-        // auto-approve path is opt-in via a JSON config file.
-        auto_approve_targets: false,
         vectors,
         duration: Duration::from_secs(duration_s),
         rampup: Duration::from_secs(rampup_s),
     };
 
     print_summary(&cfg);
-    Ok(cfg)
+    Ok(InteractivePlan {
+        cfg,
+        auto_approve,
+        stop_on_detect,
+    })
 }
 
 /// Prompt for per-vector knobs, seeded from conservative defaults. This is the

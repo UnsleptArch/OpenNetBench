@@ -416,6 +416,16 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         probe_points.clone(),
         start,
     ));
+    // Optional: watch the probe and prompt to stop the moment a finding appears.
+    let monitor = if ctx.stop_on_detect {
+        Some(tokio::spawn(detect_monitor(
+            probe_points.clone(),
+            probe_baseline_ms,
+            shutdown.clone(),
+        )))
+    } else {
+        None
+    };
 
     info!("engine live — Ctrl-C to stop");
     wait_for_stop(cfg.duration, shutdown.clone()).await;
@@ -427,6 +437,9 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
     }
     let _ = sampler.await;
     let _ = prober.await;
+    if let Some(m) = monitor {
+        m.abort();
+    }
 
     let samples = samples.lock().unwrap();
     let outcome = derive_outcome(&samples, ctx.baseline_ms);
@@ -530,6 +543,70 @@ async fn health_probe(
         }
         let ms = probe_once(addr).await;
         out.lock().unwrap().push((start.elapsed().as_millis() as u64, ms));
+    }
+}
+
+/// `--stop-on-detect` mode: watch the health probe and, the first time it shows
+/// a finding (the target stops answering after a healthy baseline, or its
+/// connect latency blows up), pause and ask the operator whether to stop.
+async fn detect_monitor(
+    probe_points: Arc<Mutex<Vec<(u64, Option<f64>)>>>,
+    baseline: Option<f64>,
+    shutdown: Arc<Shutdown>,
+) {
+    let mut down = shutdown.subscribe();
+    let mut asked = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = down.changed() => return,
+        }
+        if asked {
+            continue;
+        }
+
+        // Look at the last few probes for a sustained failure or latency blowout.
+        let (failing, slow) = {
+            let pts = probe_points.lock().unwrap();
+            if pts.len() < 2 {
+                (false, false)
+            } else {
+                let recent = &pts[pts.len().saturating_sub(3)..];
+                let failing = recent.iter().filter(|(_, ms)| ms.is_none()).count() >= 2;
+                let slow = baseline
+                    .map(|b| {
+                        recent
+                            .iter()
+                            .filter_map(|(_, ms)| *ms)
+                            .any(|ms| ms > b * 3.0 + classify::MIN_DEGRADE_DELTA_MS)
+                    })
+                    .unwrap_or(false);
+                (failing, slow)
+            }
+        };
+
+        if failing || slow {
+            asked = true;
+            let reason = if failing { "target stopped answering" } else { "target latency blew up" };
+            let sd = shutdown.clone();
+            // Prompt off-thread so we don't block the runtime; a non-TTY just
+            // continues (returns false).
+            let stop = tokio::task::spawn_blocking(move || {
+                dialoguer::Confirm::new()
+                    .with_prompt(format!("[stop-on-detect] {reason} — stop the run now?"))
+                    .default(true)
+                    .interact()
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if stop {
+                info!("stop-on-detect: operator chose to stop");
+                sd.trigger();
+                return;
+            }
+            info!("stop-on-detect: operator chose to continue");
+        }
     }
 }
 
@@ -813,7 +890,6 @@ mod tests {
             proxy: None,
             mode: RunMode::Dumb,
             run_recon: false,
-            auto_approve_targets: false,
             vectors: vec![VectorPlan {
                 vector: Vector::HttpFlood,
                 tuning: VectorTuning {

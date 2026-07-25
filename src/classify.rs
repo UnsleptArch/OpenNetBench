@@ -67,6 +67,9 @@ pub struct RunContext {
     pub baseline_ms: Option<f64>,
     /// WAF/CDN vendor inferred from the server fingerprint, if any.
     pub waf_vendor: Option<String>,
+    /// When set, the engine watches the health probe and prompts to stop the
+    /// moment it detects a finding (target down/degrading).
+    pub stop_on_detect: bool,
 }
 
 /// The observable signals the classifier reasons over.
