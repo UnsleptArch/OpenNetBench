@@ -134,7 +134,7 @@ Everything leaves one host. There is no agent protocol, no peer discovery, no re
 
 This generates real denial-of-service load. Point it only at infrastructure you own or have written authorization to test. Doing otherwise is a crime under the Computer Fraud and Abuse Act (US), the Computer Misuse Act (UK), EU Directive 2013/40/EU, and the equivalent law wherever you are. The consent gate is not decoration and it is not legal cover either, that part is on you.
 
-Good-faith authorized testing only. Your own systems, your lab, a CTF, or a client that hired you to hit them.
+Good-faith authorized testing only. Your own systems, your lab, a CTF, or a client that hired you to hit them. Blah blah blah 
 
 ---
 
