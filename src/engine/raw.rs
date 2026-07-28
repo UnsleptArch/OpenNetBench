@@ -1,12 +1,15 @@
 //! Shared raw-socket helpers for the L3/L4 packet vectors.
 //!
-//! pnet's transport API is synchronous, so each vector runs its send loop on a
-//! blocking thread and reads the shared atomics/watch directly. Source IPs are
-//! always this host's real address — no spoofing.
+//! Each raw vector elects one **leader** (worker `idx 0`); the leader spawns a
+//! pool of pinned OS threads — one per NIC TX queue (AF_XDP) or one per assigned
+//! CPU (batched AF_PACKET) — and every other logical worker no-ops. That keeps a
+//! multi-vector run off tokio's bounded blocking-thread pool, where a per-worker
+//! send loop would let the first vector starve the rest. Source IPs are always
+//! this host's real address — no spoofing.
 
 use super::net::Target;
 use super::packet_mmsg::AfPacketMmsg;
-use super::packet_tx::{AfPacket, PacketTx};
+use super::packet_tx::PacketTx;
 use super::{l2, wire, Governor, Metrics, Shutdown};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpFlags};
@@ -70,7 +73,7 @@ pub async fn tcp_flag_flood(
 }
 
 /// Fill a 20-byte TCP header for one flood packet from fresh PRNG output `r`.
-/// Shared by both transmit paths so the packet is identical either way.
+/// Shared by all transmit paths so the packet is identical either way.
 #[inline]
 fn fill_tcp(
     buf: &mut [u8; TCP_HDR_LEN],
@@ -97,70 +100,12 @@ fn fill_tcp(
     pkt.set_checksum(checksum);
 }
 
-/// Open the AF_PACKET full-frame transmit path toward `dst_ip`, or `None` (caller
-/// uses the kernel Layer-4 path). The batched AF_XDP path is sharded per NIC
-/// queue in [`tcp_flag_blocking`], not here. Returns `None` only when we're not
-/// root, L2 can't be resolved, or the AF_PACKET socket won't open.
-fn open_fast(idx: u32, dst_ip: Ipv4Addr, label: &str) -> Option<Box<dyn PacketTx>> {
-    let route = match l2::resolve(dst_ip) {
-        Ok(r) => r,
-        Err(e) => {
-            if idx == 0 {
-                warn!(vector = label, error = %e, "L2 resolve failed — using kernel transmit path");
-            }
-            return None;
-        }
-    };
-
-    // Prefer the batched sendmmsg backend (one syscall per ~1024 frames,
-    // qdisc-bypass); fall back to the plain per-frame AF_PACKET path if the raw
-    // socket can't be set up.
-    match AfPacketMmsg::new(&route, dst_ip, IPPROTO_TCP, TCP_HDR_LEN, FLOOD_TTL) {
-        Ok(tx) => {
-            if idx == 0 {
-                info!(vector = label, iface = %route.iface,
-                    next_hop_mac = %fmt_mac(route.next_hop_mac), mode = tx.mode(),
-                    "fast path armed");
-            }
-            return Some(Box::new(tx));
-        }
-        Err(e) => {
-            if idx == 0 {
-                warn!(vector = label, error = %e, "sendmmsg backend failed — trying plain AF_PACKET");
-            }
-        }
-    }
-
-    match AfPacket::new(&route, dst_ip, IPPROTO_TCP, TCP_HDR_LEN, FLOOD_TTL) {
-        Ok(tx) => {
-            // Every worker opens its own socket; only the first announces it so
-            // the log isn't flooded with one identical line per worker.
-            if idx == 0 {
-                info!(
-                    vector = label,
-                    iface = %route.iface,
-                    next_hop_mac = %fmt_mac(route.next_hop_mac),
-                    "AF_PACKET fast path armed"
-                );
-            }
-            Some(Box::new(tx))
-        }
-        Err(e) => {
-            if idx == 0 {
-                warn!(vector = label, error = %e, "AF_PACKET setup failed — using kernel transmit path");
-            }
-            None
-        }
-    }
-}
-
 fn fmt_mac(m: [u8; 6]) -> String {
     format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
 }
 
 /// The fixed per-run inputs a shard needs to build every TCP packet. `Copy` so it
 /// moves cheaply into each shard thread.
-#[cfg(feature = "xdp")]
 #[derive(Clone, Copy)]
 struct TcpParams {
     dst_ip: Ipv4Addr,
@@ -174,7 +119,6 @@ struct TcpParams {
 /// `gov_idx` indexes this vector's governor so ramp-up enables shards one at a
 /// time; `seed` seeds the PRNG for distinct flows (spread across vectors so two
 /// vectors' shards don't emit identical packets).
-#[cfg(feature = "xdp")]
 fn fast_send_loop(
     gov_idx: u32,
     seed: u32,
@@ -203,7 +147,7 @@ fn fast_send_loop(
                 // Enqueued to the wire — NOT a target response. See Metrics::packets_sent.
                 metrics.packets_sent.fetch_add(1, Relaxed);
             }
-            Ok(false) => {} // ring-full backpressure drop — attempted, not sent
+            Ok(false) => {} // ring/buffer-full backpressure drop — attempted, not sent
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);
             }
@@ -212,14 +156,12 @@ fn fast_send_loop(
 }
 
 /// One shard: the CPU core to pin its thread to, and the transmit backend.
-#[cfg(feature = "xdp")]
 type Shard = (usize, Box<dyn PacketTx>);
 
 /// Pin the calling thread to a single CPU (best-effort). Keeping a hot send loop
 /// on one core stops the scheduler migrating it — so the frame prefix, ring
 /// indices, and (when pinned to the queue's own core) the DMA'd-back completion
 /// descriptors stay in that core's cache instead of being reloaded after a bounce.
-#[cfg(feature = "xdp")]
 fn pin_current_thread_to(cpu: usize) {
     // SAFETY: cpu_set_t is a plain bitmask; CPU_SET/sched_setaffinity have no
     // preconditions beyond a zeroed set, and pid 0 targets the calling thread.
@@ -230,10 +172,9 @@ fn pin_current_thread_to(cpu: usize) {
     }
 }
 
-/// Run one thread per shard (each already bound to its own NIC queue and pinned to
-/// a core) and block until every shard finishes. `PacketTx: Send`, so each `Box`
-/// moves into its thread; the shared atomics/watch are `Arc`-cloned per shard.
-#[cfg(feature = "xdp")]
+/// Run one thread per shard (each already pinned to a core) and block until every
+/// shard finishes. `PacketTx: Send`, so each `Box` moves into its thread; the
+/// shared atomics/watch are `Arc`-cloned per shard.
 fn run_shards(
     shards: Vec<Shard>,
     p: TcpParams,
@@ -279,22 +220,19 @@ fn build_xdp_backends(
     shards
 }
 
-/// Runtime fallback when AF_XDP won't arm: `n` AF_PACKET senders (no per-queue
-/// binding limit, so several threads still parallelize the syscall path), each
-/// pinned to a distinct core so they don't contend.
-#[cfg(feature = "xdp")]
+/// Build one batched AF_PACKET (`sendmmsg`) sender per CPU in `cpus`, each shard
+/// pinned to that core. Works on any NIC — no XDP driver support needed.
 fn build_afpacket_backends(
     route: &l2::L2Route,
     p: &TcpParams,
-    n: usize,
-    ncpus: usize,
+    cpus: &[usize],
     label: &str,
 ) -> Vec<Shard> {
-    let mut shards: Vec<Shard> = Vec::with_capacity(n);
-    for i in 0..n {
+    let mut shards: Vec<Shard> = Vec::with_capacity(cpus.len());
+    for &cpu in cpus {
         match AfPacketMmsg::new(route, p.dst_ip, IPPROTO_TCP, TCP_HDR_LEN, FLOOD_TTL) {
-            Ok(tx) => shards.push((i % ncpus, Box::new(tx))),
-            Err(e) => warn!(vector = label, error = %e, "AF_PACKET shard open failed"),
+            Ok(tx) => shards.push((cpu, Box::new(tx))),
+            Err(e) => warn!(vector = label, cpu, error = %e, "AF_PACKET shard open failed"),
         }
     }
     shards
@@ -312,11 +250,6 @@ fn tcp_flag_blocking(
     queue_rank: u32,
     queue_groups: u32,
 ) {
-    // Only the AF_XDP fast path uses the queue assignment; the default build
-    // shares one AF_PACKET socket per worker and ignores it.
-    #[cfg(not(feature = "xdp"))]
-    let _ = (queue_rank, queue_groups);
-
     let dst = target.addr;
     let IpAddr::V4(dst_ip) = dst.ip() else {
         warn!("{label}: target is not IPv4 — skipping");
@@ -326,93 +259,84 @@ fn tcp_flag_blocking(
         warn!("{label}: could not determine local IPv4 source — skipping");
         return;
     };
-    let dst_port = dst.port();
-    let want_ack = flags & TcpFlags::ACK != 0;
+    let p = TcpParams {
+        dst_ip,
+        src_ip,
+        dst_port: dst.port(),
+        flags,
+        want_ack: flags & TcpFlags::ACK != 0,
+    };
 
-    // AF_XDP sharded fast path: one TX socket per NIC queue, each on its own
-    // thread (finding F3 — a single queue caps one core against one NIC ring).
-    // Only one xsk may bind a given (ifindex, queue), so worker `idx 0` owns the
-    // whole pool and the other logical workers no-op; the governor still ramps by
-    // enabling shards. Compiled only with `--features xdp`.
-    #[cfg(feature = "xdp")]
-    {
-        let p = TcpParams { dst_ip, src_ip, dst_port, flags, want_ack };
-        match l2::resolve(dst_ip) {
-            Ok(route) => {
-                if idx != 0 {
-                    return; // idx 0 is the shard leader; siblings would collide on queues
-                }
-                // This vector's disjoint slice of the NIC's TX queues, so raw
-                // vectors sharing one NIC don't fight over the same queue (EBUSY).
-                let ncpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // One leader per vector owns the shard pool; siblings no-op. Shards are their
+    // own pinned OS threads, so a multi-vector run never starves the bounded
+    // blocking-thread pool the way a per-worker send loop would.
+    if idx != 0 {
+        return;
+    }
+    let ncpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let seed_base = queue_rank.wrapping_mul(4096); // distinct flows per vector
+
+    match l2::resolve(dst_ip) {
+        Ok(route) => {
+            // AF_XDP first (built + wired): one TX-ring socket per NIC queue in
+            // this vector's disjoint queue slice (F3 line-rate path).
+            #[cfg(feature = "xdp")]
+            {
                 let nq = l2::tx_queue_count(&route.iface).min(gov.max as usize).max(1);
                 let (qstart, qend) = l2::queue_slice(nq, queue_rank, queue_groups);
                 let queues: Vec<u32> = (qstart..qend).collect();
-                let seed_base = queue_rank.wrapping_mul(4096); // distinct flows per vector
-                let (shards, mode) = if queues.is_empty() {
-                    warn!(vector = label, nq, queue_rank, queue_groups,
-                        "more raw vectors than NIC queues — no XDP slice, AF_PACKET fallback");
-                    (build_afpacket_backends(&route, &p, 1, ncpus, label), "af_packet (no queue slice)")
-                } else {
-                    let xdp = build_xdp_backends(&route, &p, &queues, ncpus, label);
-                    if xdp.is_empty() {
-                        warn!(vector = label, "AF_XDP bound no queue — falling back to AF_PACKET shards");
-                        (build_afpacket_backends(&route, &p, queues.len(), ncpus, label), "af_packet (sharded fallback)")
-                    } else {
-                        (xdp, "af_xdp (sharded, one socket per NIC queue)")
+                if !queues.is_empty() {
+                    let shards = build_xdp_backends(&route, &p, &queues, ncpus, label);
+                    if !shards.is_empty() {
+                        let cpus: Vec<usize> = shards.iter().map(|(c, _)| *c).collect();
+                        info!(vector = label, iface = %route.iface, shards = shards.len(),
+                            queues = format!("{qstart}..{qend}"), cpus = format!("{cpus:?}"),
+                            mode = "af_xdp (sharded, one socket per NIC queue)", "fast path armed");
+                        run_shards(shards, p, seed_base, metrics, gov, shutdown);
+                        return;
                     }
-                };
-                if !shards.is_empty() {
-                    let cpus: Vec<usize> = shards.iter().map(|(c, _)| *c).collect();
-                    info!(vector = label, iface = %route.iface, shards = shards.len(),
-                        queues = format!("{qstart}..{qend}"), cpus = format!("{cpus:?}"), mode,
-                        "fast path armed");
-                    run_shards(shards, p, seed_base, metrics, gov, shutdown);
-                    return;
+                    warn!(vector = label, "AF_XDP bound no queue — falling back to AF_PACKET shards");
                 }
-                warn!(vector = label, "no fast backend available — using kernel transmit path");
             }
-            Err(e) => {
-                warn!(vector = label, error = %e, "L2 resolve failed — using kernel transmit path");
-            }
-        }
-    }
 
-    let mut rng = XorShift::seeded(idx);
-    let mut buf = [0u8; TCP_HDR_LEN];
-    const FRAME_BYTES: u64 = (wire::FRAME_PREFIX_LEN + TCP_HDR_LEN) as u64;
-
-    // Fast path: AF_PACKET full-frame injection (the default build; the `xdp`
-    // build handled AF_XDP above and only reaches here if L2 resolution failed).
-    // Bypasses the IP stack, netfilter OUTPUT, and — the point — local conntrack,
-    // so a unique-flow flood doesn't exhaust our own state table first.
-    if let Some(mut tx) = open_fast(idx, dst_ip, label) {
-        loop {
-            if shutdown.is_down() {
+            // AF_PACKET batched shards (any NIC): partition the CPUs across the
+            // raw vectors so syn/ack pin to disjoint cores instead of contending.
+            let (c0, c1) = l2::queue_slice(ncpus, queue_rank, queue_groups);
+            let cpus: Vec<usize> = if c0 == c1 {
+                vec![0] // more vectors than cores — this one still gets a shard
+            } else {
+                (c0..c1).map(|c| c as usize).collect()
+            };
+            let shards = build_afpacket_backends(&route, &p, &cpus, label);
+            if !shards.is_empty() {
+                let pinned: Vec<usize> = shards.iter().map(|(c, _)| *c).collect();
+                info!(vector = label, iface = %route.iface, shards = shards.len(),
+                    cpus = format!("{pinned:?}"),
+                    mode = "af_packet+sendmmsg (batched, qdisc-bypass, sharded)", "fast path armed");
+                run_shards(shards, p, seed_base, metrics, gov, shutdown);
                 return;
             }
-            if !gov.active(idx) {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            fill_tcp(&mut buf, rng.next(), dst_port, flags, want_ack, &src_ip, &dst_ip);
-            metrics.requests_sent.fetch_add(1, Relaxed);
-            match tx.send_l4(&buf) {
-                Ok(true) => {
-                    metrics.bytes_sent.fetch_add(FRAME_BYTES, Relaxed);
-                    // Enqueued to the wire — NOT a target response. See Metrics::packets_sent.
-                    metrics.packets_sent.fetch_add(1, Relaxed);
-                }
-                Ok(false) => {} // driver buffer full — attempted, not sent
-                Err(_) => {
-                    metrics.errors.fetch_add(1, Relaxed);
-                }
-            }
+            warn!(vector = label, "no fast backend available — using kernel transmit path");
+        }
+        Err(e) => {
+            warn!(vector = label, error = %e, "L2 resolve failed — using kernel transmit path");
         }
     }
 
-    // Fallback: pnet Layer-4 (the kernel builds IP + L2). Proven, but pays the
-    // full egress path including conntrack.
+    // Last resort (L2 unresolved or no fast socket opened): kernel Layer-4 on the
+    // single leader thread. Pays the full egress path incl. conntrack; rare.
+    kernel_l4_loop(&p, &metrics, &gov, &shutdown, label);
+}
+
+/// Fallback path: pnet's synchronous Layer-4 channel (the kernel builds IP + L2).
+/// One thread; used only when the frame-injection fast paths can't be set up.
+fn kernel_l4_loop(
+    p: &TcpParams,
+    metrics: &Metrics,
+    gov: &Governor,
+    shutdown: &Shutdown,
+    label: &str,
+) {
     let proto = Layer4(Ipv4(IpNextHeaderProtocols::Tcp));
     let (mut tx, _rx) = match pnet_transport::transport_channel(4096, proto) {
         Ok(ch) => ch,
@@ -421,22 +345,21 @@ fn tcp_flag_blocking(
             return;
         }
     };
-    if idx == 0 {
-        info!(vector = label, "using kernel Layer-4 transmit path");
-    }
-
+    info!(vector = label, "using kernel Layer-4 transmit path");
+    let mut rng = XorShift::seeded(0);
+    let mut buf = [0u8; TCP_HDR_LEN];
     loop {
         if shutdown.is_down() {
             return;
         }
-        if !gov.active(idx) {
+        if !gov.active(0) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
-        fill_tcp(&mut buf, rng.next(), dst_port, flags, want_ack, &src_ip, &dst_ip);
+        fill_tcp(&mut buf, rng.next(), p.dst_port, p.flags, p.want_ack, &p.src_ip, &p.dst_ip);
         metrics.requests_sent.fetch_add(1, Relaxed);
         let pkt = MutableTcpPacket::new(&mut buf).expect("20-byte buffer fits a TCP header");
-        match tx.send_to(pkt, IpAddr::V4(dst_ip)) {
+        match tx.send_to(pkt, IpAddr::V4(p.dst_ip)) {
             Ok(n) => {
                 metrics.bytes_sent.fetch_add(n as u64, Relaxed);
                 metrics.packets_sent.fetch_add(1, Relaxed);

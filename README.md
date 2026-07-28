@@ -1,63 +1,53 @@
 # OpenNetBench
 
-**Single-origin network resilience assessment for authorized testing.**
-`beta v1` · Rust · GPLv3
+**Single-origin adversarial load generator for authorized resilience testing.**
+Rust. GPLv3. Linux.
 
-OpenNetBench generates the adversarial load patterns real threat actors use —
-not benign synthetic traffic — so you can find your infrastructure's actual
-breaking point before an attacker does. It runs sixteen vectors from L3 to L7,
-measures the target with an independent health probe, and **classifies the
-outcome**: did the defence hold, or did the service break?
+Most load testers ask "how do you handle 10,000 happy shoppers." That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
 
-Most load testers (JMeter, wrk, Locust) model legitimate users. They tell you how
-you handle 10,000 shoppers. They don't tell you how you handle a slowloris hold,
-an HTTP/2 rapid-reset campaign, or a connection-table exhaustion attempt.
-OpenNetBench fills that gap — scoped to systems you own or are authorized to test.
+It runs sixteen vectors from L3 to L7 off a single box. No spoofing, no amplification, no botnet, no C2. One real source IP that you can trace and kill instantly. That is a deliberate design choice, not a limitation, and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md).
+
+This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench hands you a verdict.
 
 ---
 
-## Highlights
+## Why it exists
 
-- **16 vectors, L3→L7** — volumetric, slow-connection, state-exhaustion, protocol
-  abuse. Three named CVEs (2023-44487, 2024-27316, 2011-3192).
-- **Auto-engine** — probe a target, characterize it, and get a recommended
-  attack combo with reasoning (`--auto`).
-- **Presets** — one-command profiles (`router`, `web`, `api`, `cdn`, `dns`, …),
-  each running at full pressure. Dump with `--save-config` and edit to dial back.
-- **Ground-truth classification** — two independent observers (a TCP health
-  probe and a real HTTP service probe) watch the target, and the classifier
-  reports `Healthy` / `MitigationEngaged` / `EdgeBlocked` / `Degrading` / `Down`
-  with a confidence and evidence. It tells a target that *crashed* apart from one
-  that our own box couldn't reach, and catches slow-connection exhaustion that
-  still answers TCP.
-- **Honest per-vector metrics** — RPS is completed responses over the real
-  elapsed window; connectionless floods report a separate send rate, never faked
-  as delivered load; each vector self-throttles on its own signal.
-- **Real measurement** — the collapse curve (windowed p50/p95/p99 vs load),
-  time-to-degradation, the knee, and **recovery time** — the metric almost
-  nobody measures, and gold for blue teams.
-- **SOCKS5 proxy** — route the TCP load path (and recon) through a SOCKS5 proxy
-  (e.g. Tor) via the interactive prompt or a config file. Raw L3/L4 and UDP can't
-  be proxied and egress directly (the tool warns); the probes stay direct.
-- **Fits the host** — reads `RLIMIT_NOFILE` and scales concurrency to fit, so it
-  stresses the target instead of exhausting its own sockets.
-- **Fast and lean** — lock-free atomics, a fixed 4 KB latency histogram, zero
-  per-request allocation, bounded shutdown that always stops the traffic.
+wrk, JMeter, Locust and friends model legitimate users. They tell you your throughput ceiling under polite traffic. None of them will hold ten thousand half-open connections until your worker pool starves, or open a stream and reset it before the server can breathe, or fill a home router's conntrack table in under a second. Those are the patterns that actually cause outages and those are the patterns this tool speaks.
+
+The other half of the tool is the part nobody else bothers with. Generating load is easy. Knowing whether the target actually degraded, versus your own box running out of sockets, versus a WAF quietly eating the traffic, that is the hard part. OpenNetBench runs two independent observers against the target the whole time and classifies the outcome with a confidence and an evidence trail. It will not call a working rate limiter a "vuln" and it will not blame the target for your local port exhaustion.
+
+---
+
+## What it can actually push
+
+The send path was measured at **25.6 million packets per second** of 54-byte frames on a single desktop (Ryzen 7800X3D, 16 pinned shards, AF_PACKET plus batched `sendmmsg` with the qdisc bypassed). That is past 10GbE line rate. For anything up to and including a 10-gig target the tool is bound by the wire, not by the code.
+
+That number matters because of the acceptance bar this was built against: crash a real home router in under thirty seconds. It does. On a live run the gateway went from answering to fully down in about six seconds, off state exhaustion, on wifi, nowhere near the code's ceiling.
+
+Full breakdown, the harnesses, and every ceiling we hit is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ---
 
 ## Install
 
 ```bash
-git clone <your-repo-url> && cd OpenNetBench
-./install.sh            # builds release, installs `opennetbench` to ~/.local/bin
-# or: ./install.sh --system   (machine-wide, /usr/local/bin)
+git clone https://github.com/UnsleptArch/OpenNetBench.git
+cd OpenNetBench
+./install.sh
 ```
 
-Requires the Rust toolchain (<https://rustup.rs>). Raw-socket vectors
-(`syn_flood`, `ack_flood`, `icmp_flood`) need `sudo` at run time.
+That builds the release binary and puts `opennetbench` on your PATH. It will also add `~/.local/bin` to your shell profile if it is not already there, so a fresh shell just works.
 
-Prefer to build only:
+```bash
+./install.sh --system    # machine-wide, /usr/local/bin, uses sudo
+./install.sh --xdp       # build the AF_XDP backend too (needs a capable NIC)
+./install.sh --uninstall # remove it
+```
+
+You need the Rust toolchain (https://rustup.rs). Raw-socket vectors (`syn_flood`, `ack_flood`, `icmp_flood`) need `sudo` at run time.
+
+Just want the binary, no PATH surgery:
 
 ```bash
 cargo build --release   # ./target/release/opennetbench
@@ -68,118 +58,90 @@ cargo build --release   # ./target/release/opennetbench
 ## Quick start
 
 ```bash
-# Interactive — walks you through target, vectors, tuning, timing
+# interactive, walks you through target, vectors, tuning, timing
 opennetbench
 
-# See what's available
+# see what ships
 opennetbench --list-presets
 
-# Auto: probe the target, recommend a combo, then run it
+# let it probe the target, characterize it, recommend a combo, then run
 opennetbench --auto --target example.com --duration 60
 
-# Preset, one shot
+# one preset, one shot
 opennetbench --preset web --target https://example.com --duration 60
 
-# Router / gateway state-exhaustion (raw sockets → sudo)
+# home router / gateway state exhaustion, raw sockets so sudo
 sudo opennetbench --preset router --target 192.168.1.254 --duration 40
 
-# Generate an editable plan without running it
+# build an editable plan without firing it, run it later
 opennetbench --preset api --target https://api.example.com --save-config api.json
-opennetbench --config api.json     # run it later (edit the JSON freely)
+opennetbench --config api.json
 ```
 
-**Targets:** a URL or a bare IP. Bare IPs default to `http://` (router/admin UIs
-are usually plaintext, and L4 vectors just need `address:port`); hostnames
-default to `https://`.
+Targets are a URL or a bare IP. Bare IPs default to `http://` because router and admin UIs are usually plaintext and the L4 vectors just want `address:port`. Hostnames default to `https://`.
 
-### Useful flags
-
-| Flag | Effect |
-|---|---|
-| `--auto` | probe → characterize → recommend → run |
-| `--preset <name>` | run a built-in combo |
-| `--target <url\|ip>` | the target |
-| `--duration <s>` / `--rampup <s>` | run length / ramp (0 duration = until stopped) |
-| `--auto-approve` | let recon auto-pick the top target (no prompt) |
-| `--stop-on-detect` | pause and ask to stop the moment a finding appears (off = full duration) |
-| `--save-config <file>` | write the resolved plan to JSON and exit |
-| `--list-presets` | list presets |
+Full flag and preset reference lives in [docs/USAGE.md](docs/USAGE.md).
 
 ---
 
-## Vectors
+## The vectors
 
-| Vector | Layer | Description |
+| Vector | Layer | What it does |
 |---|---|---|
-| `http_flood` / `https_only` | L7 | HTTP/1.1+2 flood, rotating browser fingerprints |
-| `range_flood` | L7 | CVE-2011-3192 overlapping `Range` headers |
-| `slowloris` | L7 | incomplete-header hold — drains the connection pool |
-| `rudy` | L7 | slow POST body trickle — ties up worker threads |
-| `slow_read` | L7 | tiny receive window — holds the server's send buffer |
+| `http_flood` / `https_only` | L7 | keep-alive HTTP/1.1 flood, rotating browser fingerprints |
+| `range_flood` | L7 | CVE-2011-3192, a pile of overlapping `Range` headers |
+| `slowloris` | L7 | incomplete headers held open, drains the connection pool |
+| `rudy` | L7 | slow POST body, one byte at a time, ties up workers |
+| `slow_read` | L7 | tiny receive window, pins the server's send buffer |
 | `h2_flood` | L7 | multiplexed HTTP/2 request flood |
-| `h2_rapid_reset` | L7 | CVE-2023-44487 — stream open + immediate RST |
-| `h2_continuation` | L7 | CVE-2024-27316 — endless CONTINUATION frames |
-| `tls_exhaust` | L4/5 | repeated TLS handshakes — asymmetric server CPU |
-| `tcp_exhaust` | L4 | connection-table / accept-backlog exhaustion |
-| `syn_flood` | L4 | raw TCP SYN flood (root) |
-| `ack_flood` | L4 | raw ACK flood — stresses stateful firewall/conntrack (root) |
-| `udp_flood` | L4 | UDP flood, configurable payload |
+| `h2_rapid_reset` | L7 | CVE-2023-44487, open a stream and immediately reset it |
+| `h2_continuation` | L7 | CVE-2024-27316, endless CONTINUATION frames with no end |
+| `tls_exhaust` | L4/5 | repeat full TLS handshakes, cheap for you and expensive for them |
+| `tcp_exhaust` | L4 | hold bare connections, exhaust the accept backlog / conn table |
+| `syn_flood` | L4 | raw TCP SYN flood, real source IP (root) |
+| `ack_flood` | L4 | raw ACK flood, beats on stateful firewalls and conntrack (root) |
+| `udp_flood` | L4 | UDP flood, payload you pick |
 | `dns_flood` | L7 | random-subdomain query flood |
 | `icmp_flood` | L3 | ICMP echo flood (root) |
 
-**Load level:** presets run at a single fixed pressure (2700 workers/vector).
-Tune per-vector concurrency by dumping with `--save-config` and editing the JSON,
-or use the interactive flow's per-vector prompts.
+Deeper notes on each one, and why it hurts, are in [docs/VECTORS.md](docs/VECTORS.md).
 
 ---
 
 ## How it decides "it broke"
 
-An independent health probe connects to the target once a second throughout the
-run (with a pre-load baseline). The classifier reads that ground truth plus the
-collapse curve and HTTP status mix:
+An independent health probe TCP-connects to the target once a second the whole run, with a baseline taken before load starts. A second probe fires a real HTTP GET once a second when the app answered at baseline. The classifier reads both, plus the collapse curve (windowed p50/p95/p99 against load) and the HTTP status mix, and returns one of:
 
-- **MitigationEngaged** — 429s (rate limiter) or 403s + a WAF/CDN fingerprint.
-  The defence is working; not a finding.
-- **Degrading / Down** — p99 blows past baseline, or the probe stops answering
-  under load. A real resource-exhaustion finding.
-- **EdgeBlocked** — fast connection refusals with no application response.
-- **Healthy** — the target absorbed it.
+- **MitigationEngaged** — 429s from a rate limiter, or 403s with a WAF/CDN fingerprint. The defense is doing its job. Not a finding.
+- **Degrading / Down** — p99 blows past baseline, or the probe stops answering. A real resource-exhaustion finding.
+- **EdgeBlocked** — fast refusals, no application response.
+- **Healthy** — the target ate it and kept going.
 
-Confidence is capped at 0.9 — it reports likelihood, never proof.
+Confidence is capped at 0.9. It reports likelihood, never proof. It also knows the difference between the target dying and your own box running out of sockets, which is the mistake that makes most homegrown flooders lie to you.
 
 ---
 
-## Design notes
+## Safety model
 
-Single origin, by design: all traffic leaves this host. There is **no IP
-spoofing, no amplification, and no command-and-control** — this is a resilience
-tester, not a botnet or a C2 framework. A single, real source IP means every run
-is fully attributable and instantly containable: stop the process, stop the
-traffic. See [DOCUMENTATION.md](DOCUMENTATION.md) for the full architecture.
+Everything leaves one host. There is no agent protocol, no peer discovery, no remote control anywhere in the tree, and the raw vectors compute their checksums from the machine's real source IP so spoofing is not even wired up. Every run starts with a consent gate you have to type an exact phrase into at a real terminal, it cannot be satisfied by a flag or a pipe. Stop the process, stop the traffic. The full threat model is in [docs/SAFETY.md](docs/SAFETY.md).
 
 ---
 
 ## Authorized use only
 
-OpenNetBench generates real denial-of-service load. Point it **only** at
-infrastructure you own or have explicit written authorization to test. Running it
-against systems you don't control is illegal under the Computer Fraud and Abuse
-Act (US), the Computer Misuse Act (UK), EU Directive 2013/40/EU, and equivalent
-laws elsewhere. A consent gate requires you to attest authorization at the start
-of every run — it's not decorative.
+This generates real denial-of-service load. Point it only at infrastructure you own or have written authorization to test. Doing otherwise is a crime under the Computer Fraud and Abuse Act (US), the Computer Misuse Act (UK), EU Directive 2013/40/EU, and the equivalent law wherever you are. The consent gate is not decoration and it is not legal cover either, that part is on you.
 
-Good-faith, authorized security research only: your own systems, lab
-environments, CTFs, or client infrastructure you're engaged to assess.
+Good-faith authorized testing only. Your own systems, your lab, a CTF, or a client that hired you to hit them.
 
 ---
 
-## Status
+## Docs
 
-**Beta v1.** The engine, vectors, recon, auto-engine, presets, health
-probe, and classifier are complete and tested. On the roadmap: the live
-dashboard (animated collapse curve + findings), SQLite run history, and CVE
-correlation.
+- [docs/USAGE.md](docs/USAGE.md) — every flag, preset, and config knob
+- [docs/VECTORS.md](docs/VECTORS.md) — the sixteen vectors in detail
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine is built, module by module
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — the fast path, the numbers, the benchmarking method
+- [docs/SAFETY.md](docs/SAFETY.md) — single origin, no spoofing, no C2, why it is built this way
 
 ## License
 
