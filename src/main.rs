@@ -80,6 +80,12 @@ struct Args {
     /// Serve the dashboard UI over existing run history and exit (no run).
     #[arg(long)]
     ui_only: bool,
+
+    /// Directory for run log files. Default: $XDG_STATE_HOME/opennetbench
+    /// (else ~/.local/state/opennetbench). If it can't be written, the run
+    /// still proceeds with terminal-only logging.
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -87,7 +93,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let run_id = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let (log_path, _guard) = logging::init(&run_id)?;
+    let (log_path, _guard) = logging::init(&run_id, args.log_dir.clone());
 
     cli::banner();
 
@@ -212,7 +218,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    info!(run_id, log = %log_path.display(), "run authorized — handing to engine");
+    let log_display = log_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "terminal-only".to_string());
+    info!(run_id, log = %log_display, "run authorized — handing to engine");
     engine::run(&cfg, ctx).await?;
 
     info!("run complete");

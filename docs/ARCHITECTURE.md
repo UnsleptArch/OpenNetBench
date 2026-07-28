@@ -115,7 +115,7 @@ Backends, fastest first:
 
 ## Cross-cutting
 
-`logging.rs` sends tracing to a timestamped `logs/onb-<runid>.log` and the terminal. `metrics.rs` holds the serializable shapes a report or the future dashboard will consume. `db.rs` and `web/` are stubs for the planned SQLite history and dashboard.
+`logging.rs` sends tracing to a timestamped `onb-<runid>.log` under `$XDG_STATE_HOME/opennetbench` (or `~/.local/state/opennetbench`, override with `--log-dir`) and the terminal. If that directory can't be written it warns and keeps going terminal-only. `metrics.rs` holds the serializable shapes a report or the future dashboard will consume. `db.rs` and `web/` are stubs for the planned SQLite history and dashboard.
 
 ## Extending it
 
