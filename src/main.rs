@@ -86,6 +86,17 @@ struct Args {
     /// still proceeds with terminal-only logging.
     #[arg(long, value_name = "DIR")]
     log_dir: Option<PathBuf>,
+
+    /// Run recon against this URL, print the ranked report, and exit. Sends only
+    /// recon's own bounded probes — never a flood. Still requires consent, since
+    /// active recon sends crafted requests and a small burst to the target.
+    #[arg(long, value_name = "URL")]
+    recon: Option<String>,
+
+    /// Wordlist file for the path-exposure scan (one path per line, `#` comments).
+    /// If omitted, recon prompts and offers a built-in default.
+    #[arg(long, value_name = "FILE")]
+    wordlist: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -130,6 +141,18 @@ async fn main() -> Result<()> {
     // Legal notice + mandatory consent gate — always, before anything else.
     println!("{}\n", auth::LEGAL_NOTICE);
     auth::require_consent()?;
+
+    // --recon: recon-only. Run the recon suite against the URL, print the ranked
+    // report, and exit. No flood is scheduled — only recon's bounded probes.
+    if let Some(target) = &args.recon {
+        let wordlist = cli::choose_wordlist(args.wordlist.as_ref())?;
+        println!("Recon-only against {target} — no flood will be sent.\n");
+        match recon::run_recon(target, None, wordlist.as_deref()).await {
+            Ok(report) => cli::present_recon(&report),
+            Err(e) => return Err(anyhow!("recon failed: {e}")),
+        }
+        return Ok(());
+    }
 
     // Base from flags; the interactive flow may override with y/n answers.
     let mut auto_approve = args.auto_approve;
@@ -181,8 +204,9 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     if cfg.run_recon {
+        let wordlist = cli::choose_wordlist(args.wordlist.as_ref())?;
         info!(target = %cfg.target, "recon: starting");
-        match recon::run_recon(&cfg.target, cfg.proxy.as_ref()).await {
+        match recon::run_recon(&cfg.target, cfg.proxy.as_ref(), wordlist.as_deref()).await {
             Ok(report) => {
                 cli::present_recon(&report);
                 ctx.waf_vendor = classify::detect_waf(report.server_fingerprint.as_deref());

@@ -62,10 +62,21 @@ pub struct Fingerprint {
     pub missing_security_headers: Vec<String>,
     pub allowed_methods: Vec<String>,
     pub exposed_paths: Vec<String>,
+    /// The server returns a non-404 catch-all for unknown paths (typical of a
+    /// SPA history fallback). The sensitive-path results were filtered against it.
+    pub spa_catchall: bool,
 }
 
-/// Run the read-only fingerprinting suite against `base`.
-pub async fn fingerprint(client: &Client, base: &str) -> Fingerprint {
+/// The built-in sensitive-path wordlist, as owned strings (so a caller can swap
+/// in a custom list of the same shape).
+pub fn default_wordlist() -> Vec<String> {
+    SENSITIVE_PATHS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Run the read-only fingerprinting suite against `base`, probing `paths` for
+/// exposure. Catch-all servers are detected first so the path scan doesn't
+/// report the whole wordlist as "exposed".
+pub async fn fingerprint(client: &Client, base: &str, paths: &[String]) -> Fingerprint {
     let mut server = None;
     let mut missing = Vec::new();
 
@@ -82,12 +93,65 @@ pub async fn fingerprint(client: &Client, base: &str) -> Fingerprint {
         }
     }
 
+    let base_url = url::Url::parse(base).ok();
+    let catchall = match &base_url {
+        Some(u) => detect_catchall(client, u).await,
+        None => None,
+    };
+    let exposed = match &base_url {
+        Some(u) => probe_sensitive(client, u, paths, catchall.as_ref()).await,
+        None => Vec::new(),
+    };
+
     Fingerprint {
         server,
         missing_security_headers: missing,
         allowed_methods: enumerate_methods(client, base).await,
-        exposed_paths: probe_sensitive(client, base).await,
+        exposed_paths: exposed,
+        spa_catchall: catchall.is_some(),
     }
+}
+
+/// The response signature of a server's catch-all handler.
+struct CatchAll {
+    status: u16,
+    len: usize,
+}
+
+async fn fetch_status_len(client: &Client, url: url::Url) -> Option<(u16, usize)> {
+    let resp = client.get(url).send().await.ok()?;
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().await.ok()?;
+    Some((status, bytes.len()))
+}
+
+/// Two byte lengths are "the same page": within 64 bytes or 5%.
+fn lens_similar(a: usize, b: usize) -> bool {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    hi - lo <= 64 || (lo > 0 && (hi - lo) * 100 / lo <= 5)
+}
+
+/// Detect a catch-all by requesting two random paths that should 404. If both
+/// return the same non-404 status with a near-identical body, the server serves
+/// a fallback (SPA index) for everything.
+async fn detect_catchall(client: &Client, base: &url::Url) -> Option<CatchAll> {
+    let mut seen = Vec::new();
+    for p in ["/onb-nope-7f3a9c2e", "/onb-absent-1b8d4e6f/sub"] {
+        if let Ok(u) = base.join(p) {
+            if let Some(sl) = fetch_status_len(client, u).await {
+                seen.push(sl);
+            }
+        }
+    }
+    if let [(s1, l1), (s2, l2)] = seen[..] {
+        if s1 != 404 && s1 == s2 && lens_similar(l1, l2) {
+            return Some(CatchAll {
+                status: s1,
+                len: (l1 + l2) / 2,
+            });
+        }
+    }
+    None
 }
 
 /// Prefer the `Allow` header from OPTIONS; note TRACE if the server honors it.
@@ -106,21 +170,49 @@ async fn enumerate_methods(client: &Client, base: &str) -> Vec<String> {
     methods
 }
 
-/// Probe the sensitive-path list; report those that don't 404 / error.
-async fn probe_sensitive(client: &Client, base: &str) -> Vec<String> {
-    let base_url = match url::Url::parse(base) {
-        Ok(u) => u,
-        Err(_) => return Vec::new(),
-    };
+/// Probe `paths` for exposure. A path counts as exposed only if it doesn't
+/// 404/400 AND its response differs from the catch-all signature (if any) — so a
+/// SPA that serves index.html for everything doesn't light up the whole list.
+async fn probe_sensitive(
+    client: &Client,
+    base_url: &url::Url,
+    paths: &[String],
+    catchall: Option<&CatchAll>,
+) -> Vec<String> {
     let mut exposed = Vec::new();
-    for path in SENSITIVE_PATHS {
+    for path in paths {
         let Ok(url) = base_url.join(path) else { continue };
-        if let Ok(resp) = client.get(url.clone()).send().await {
-            let s = resp.status().as_u16();
-            if s != 404 && s != 400 {
-                exposed.push(format!("{path} [{s}]"));
+        let Some((s, len)) = fetch_status_len(client, url).await else { continue };
+        if s == 404 || s == 400 {
+            continue;
+        }
+        if let Some(ca) = catchall {
+            // Same response as the catch-all → not a real exposure.
+            if s == ca.status && lens_similar(len, ca.len) {
+                continue;
             }
         }
+        exposed.push(format!("{path} [{s}]"));
     }
     exposed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lengths_similar_within_tolerance() {
+        assert!(lens_similar(1000, 1000));
+        assert!(lens_similar(1000, 1030)); // within 64
+        assert!(lens_similar(10_000, 10_400)); // within 5%
+        assert!(!lens_similar(1000, 5000));
+    }
+
+    #[test]
+    fn default_wordlist_is_nonempty_and_rooted() {
+        let wl = default_wordlist();
+        assert!(wl.len() > 20);
+        assert!(wl.iter().all(|p| p.starts_with('/')));
+    }
 }

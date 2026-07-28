@@ -3,9 +3,10 @@
 //! proxy, mode, recon, per-vector tuning, timing, final summary.
 
 use crate::config::{ProxyConfig, RunConfig, RunMode, Vector, VectorPlan, VectorTuning};
-use crate::recon::ReconReport;
+use crate::recon::{ReconReport, Weakness};
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Load a run plan from a JSON file (same shape as [`RunConfig`]). The consent
@@ -29,6 +30,9 @@ pub fn present_recon(report: &ReconReport) {
         "server       : {}",
         report.server_fingerprint.as_deref().unwrap_or("unknown")
     );
+    if report.spa_catchall {
+        println!("catch-all    : yes (SPA fallback) — exposure scan filtered against it");
+    }
     if !report.allowed_methods.is_empty() {
         println!("methods      : {}", report.allowed_methods.join(", "));
     }
@@ -44,16 +48,75 @@ pub fn present_recon(report: &ReconReport) {
     println!("ranked endpoints (by asymmetry):");
     for (i, ep) in report.ranked_endpoints.iter().take(15).enumerate() {
         println!(
-            "  {:>2}. {:>7.1}  {:>7.1}ms  {}{}  {}",
+            "  {:>2}. [{:>5.1}] {:<4} {:<9} {}{}",
             i + 1,
             ep.asymmetry,
-            ep.baseline_ms,
             ep.method,
+            weakness_label(ep.weakness),
+            ep.url,
             if ep.cacheable { " [cached]" } else { "" },
-            ep.url
+        );
+        println!(
+            "        {}  |  baseline {:.0}ms  conf {:.2}",
+            ep.note, ep.baseline_ms, ep.confidence
         );
     }
     println!("========================\n");
+}
+
+/// Resolve the exposure-scan wordlist: the flag's file if given, otherwise ask
+/// the operator (built-in default vs. a custom file). `None` means the built-in
+/// list, which recon fills in.
+pub fn choose_wordlist(flag: Option<&PathBuf>) -> Result<Option<Vec<String>>> {
+    if let Some(p) = flag {
+        return Ok(Some(load_wordlist(p)?));
+    }
+    let choice = Select::new()
+        .with_prompt("Wordlist for the path-exposure scan")
+        .items(&["Built-in (~40 common paths)", "Custom file..."])
+        .default(0)
+        .interact()?;
+    if choice == 0 {
+        Ok(None)
+    } else {
+        let path: String = Input::new()
+            .with_prompt("Wordlist file path (one path per line)")
+            .interact_text()?;
+        Ok(Some(load_wordlist(Path::new(&path))?))
+    }
+}
+
+fn load_wordlist(path: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading wordlist {}", path.display()))?;
+    let paths: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            if l.starts_with('/') {
+                l.to_string()
+            } else {
+                format!("/{l}")
+            }
+        })
+        .collect();
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "wordlist {} has no usable entries",
+        path.display()
+    );
+    Ok(paths)
+}
+
+fn weakness_label(w: Weakness) -> &'static str {
+    match w {
+        Weakness::InputCompute => "compute",
+        Weakness::Bandwidth => "bandwidth",
+        Weakness::Degradation => "degrade",
+        Weakness::GraphQL => "graphql",
+        Weakness::Static => "static",
+    }
 }
 
 /// Choose which endpoint becomes the flood target. In `auto` mode the highest-
