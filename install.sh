@@ -83,9 +83,9 @@ cat <<'EOF'
 
 Quick start:
   opennetbench                                   # interactive
-  opennetbench --list-presets                    # presets & tiers
+  opennetbench --list-presets                    # list presets
   opennetbench --auto --target example.com       # probe → recommend → run
-  sudo opennetbench --preset router --tier aggressive --target 192.168.1.254 --duration 40
+  sudo opennetbench --preset router --target 192.168.1.254 --duration 40
 
 Raw-socket vectors (syn/ack/icmp) require sudo. Authorized targets only.
 EOF

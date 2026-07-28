@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Result};
 use dialoguer::Input;
+use std::io::IsTerminal;
 
 const CONSENT_PHRASE: &str = "I HAVE AUTHORIZATION";
 
@@ -23,12 +24,20 @@ byte is attributable to you.";
 /// Block until the operator types the exact consent phrase. Returns an error
 /// (aborting the run) on any mismatch. Never auto-passes.
 pub fn require_consent() -> Result<()> {
+    // Enforce the TTY requirement ourselves rather than relying on the prompt
+    // library's behavior: a piped/redirected stdin can never satisfy consent.
+    if !std::io::stdin().is_terminal() {
+        bail!("authorization requires an interactive terminal — refusing piped/non-TTY input");
+    }
+
     let entered: String = Input::new()
         .with_prompt(format!("Type exactly '{CONSENT_PHRASE}' to proceed"))
         .allow_empty(true)
         .interact_text()?;
 
-    if entered.trim() != CONSENT_PHRASE {
+    // Exact match — no trimming. "Type exactly" means exactly; a padded phrase
+    // is not the phrase.
+    if entered != CONSENT_PHRASE {
         bail!("authorization phrase not confirmed — aborting");
     }
     Ok(())

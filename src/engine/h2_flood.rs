@@ -84,7 +84,12 @@ pub async fn worker(
                 }
             };
 
-            match resp_fut.await {
+            // Race the response against shutdown so a silent stream can't pin us.
+            let resp = tokio::select! {
+                r = resp_fut => r,
+                _ = down.changed() => break 'req,
+            };
+            match resp {
                 Ok(resp) => {
                     metrics.record_latency(t0.elapsed());
                     metrics.record_status(resp.status().as_u16());

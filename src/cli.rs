@@ -123,6 +123,18 @@ pub fn interactive_flow() -> Result<InteractivePlan> {
         None
     };
 
+    // Preset shortcut -------------------------------------------------------
+    // Offer the curated combos before the full manual walkthrough. A preset
+    // fixes the vector mix, mode, and recon choice; the operator still sets
+    // timing and the stop/approval behavior.
+    if Confirm::new()
+        .with_prompt("Use a preset (curated vector combo for a kind of target)?")
+        .default(false)
+        .interact()?
+    {
+        return preset_flow(target, proxy);
+    }
+
     // Mode ------------------------------------------------------------------
     let modes = [RunMode::Adaptive, RunMode::Dumb];
     let mode_idx = Select::new()
@@ -193,6 +205,71 @@ pub fn interactive_flow() -> Result<InteractivePlan> {
         duration: Duration::from_secs(duration_s),
         rampup: Duration::from_secs(rampup_s),
     };
+
+    print_summary(&cfg);
+    Ok(InteractivePlan {
+        cfg,
+        auto_approve,
+        stop_on_detect,
+    })
+}
+
+/// Preset shortcut: pick a curated combo, then only prompt for the choices a
+/// preset leaves open (timing, stop-on-detect, and recon auto-approve). The
+/// preset fixes the vectors, run mode, and whether recon runs; every preset hits
+/// at full pressure and can be edited afterward via `--save-config`.
+fn preset_flow(target: String, proxy: Option<ProxyConfig>) -> Result<InteractivePlan> {
+    use crate::presets;
+
+    let labels: Vec<String> = presets::PRESETS
+        .iter()
+        .map(|p| {
+            let sudo = if p.needs_root { " [sudo]" } else { "" };
+            format!("{:<12} {}{}", p.name, p.description, sudo)
+        })
+        .collect();
+    let idx = Select::new()
+        .with_prompt("Preset")
+        .items(&labels)
+        .default(0)
+        .interact()?;
+    let preset = &presets::PRESETS[idx];
+
+    if preset.needs_root {
+        println!("note: '{}' uses raw-socket vectors — run under sudo or they are skipped.", preset.name);
+    }
+
+    let duration_s: u64 = Input::new()
+        .with_prompt("Duration (seconds, 0 = until stopped)")
+        .default(60)
+        .interact_text()?;
+    let rampup_s: u64 = Input::new()
+        .with_prompt("Ramp-up (seconds)")
+        .default(10)
+        .interact_text()?;
+
+    // Recon-driven presets can auto-approve their top-ranked target.
+    let auto_approve = if preset.run_recon {
+        Confirm::new()
+            .with_prompt("Auto-approve recon's top-ranked target (skip the pick prompt)?")
+            .default(false)
+            .interact()?
+    } else {
+        false
+    };
+
+    let stop_on_detect = Confirm::new()
+        .with_prompt("Stop and ask when a finding is detected? (No = run the full duration)")
+        .default(false)
+        .interact()?;
+
+    let cfg = presets::build_config(
+        preset,
+        target,
+        proxy,
+        Duration::from_secs(duration_s),
+        Duration::from_secs(rampup_s),
+    );
 
     print_summary(&cfg);
     Ok(InteractivePlan {

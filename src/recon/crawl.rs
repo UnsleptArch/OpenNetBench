@@ -24,7 +24,9 @@ pub async fn crawl(client: &Client, base: &str, max_pages: usize, max_depth: usi
     let Ok(base_url) = Url::parse(base) else {
         return CrawlResult { urls, forms };
     };
-    let host = base_url.host_str().unwrap_or("").to_string();
+    // Scope the crawl to the exact ORIGIN, not just the host: a different scheme
+    // or port is a different service and must not be pulled in as a flood target.
+    let origin = Origin::of(&base_url);
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(Url, usize)> = VecDeque::new();
@@ -52,7 +54,7 @@ pub async fn crawl(client: &Client, base: &str, max_pages: usize, max_depth: usi
 
         for (kind, raw) in extract_refs(&body) {
             let Ok(resolved) = url.join(&raw) else { continue };
-            if resolved.host_str() != Some(host.as_str()) {
+            if Origin::of(&resolved) != origin {
                 continue;
             }
             match kind {
@@ -71,6 +73,26 @@ pub async fn crawl(client: &Client, base: &str, max_pages: usize, max_depth: usi
     }
 
     CrawlResult { urls, forms }
+}
+
+/// A same-origin key: scheme + host + effective port. Two URLs share an origin
+/// only if all three match (https://x:8443 and http://x:80 do not).
+#[derive(PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+impl Origin {
+    fn of(u: &Url) -> Origin {
+        let scheme = u.scheme().to_string();
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        Origin {
+            scheme,
+            host: u.host_str().unwrap_or("").to_string(),
+            port: u.port().unwrap_or(default_port),
+        }
+    }
 }
 
 enum RefKind {
@@ -109,7 +131,7 @@ fn extract_refs(html: &str) -> Vec<(RefKind, String)> {
             .map(|e| tag_start + e)
             .unwrap_or(bytes.len());
         let tag = &html[tag_start..tag_end];
-        let action = attr_value(tag, "action").unwrap_or_else(|| "".to_string());
+        let action = attr_value(tag, "action").unwrap_or_default();
         let method = attr_value(tag, "method").unwrap_or_else(|| "GET".to_string());
         if !action.is_empty() {
             out.push((RefKind::Form(method.to_uppercase()), action));

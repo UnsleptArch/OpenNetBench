@@ -39,14 +39,14 @@ containable" — stop the process, stop the traffic.
 
 ```
 parse CLI (clap Args)
-  ├─ --list-presets      → print presets/tiers, exit
+  ├─ --list-presets      → print presets, exit
   ├─ --save-config       → build plan (preset/config), write JSON, exit   [no consent]
   ├─ --ui-only           → serve dashboard, exit
   └─ run path:
        legal notice + consent gate (auth::require_consent)   ← always
        resolve plan:
          --auto     → auto::characterize → auto::recommend → presets::build_config
-         --preset   → presets::build_config(preset, tier, target)
+         --preset   → presets::build_config(preset, target)
          --config   → cli::load_config(json)
          (none)     → cli::interactive_flow  (also prompts auto_approve, stop_on_detect)
        if run_recon → recon::run_recon → present → select/auto-approve target
@@ -69,18 +69,16 @@ in `main` before the engine starts.
 - **`RunMode`** — `Adaptive` (self-throttles under distress, measures recovery)
   or `Dumb` (sustained max load; use this to pressure something that shrugs off
   adaptive back-off).
-- **`Tier`** — aggressiveness: `Recon` (probe-only, concurrency 0), `Light` (50),
-  `Moderate` (200), `Aggressive` (800), `Brutal` (3000) per-vector concurrency.
 - **`VectorTuning`** — per-vector knobs (concurrency, rate/worker, payload bytes,
   trickle interval, port). `defaults_for(vector)` gives conservative starting
-  points; a preset overrides `concurrency` with the tier's value.
+  points; a preset overrides `concurrency` with `PRESET_CONCURRENCY` (2700).
 - **`RunConfig`** — the fully-resolved, serializable plan (target, proxy, mode,
   recon flag, vectors, duration, ramp-up). This is what `--save-config` writes
   and `--config` reads.
 
 ---
 
-## 5. Presets & tiers (`presets.rs`)
+## 5. Presets (`presets.rs`)
 
 A `Preset` is a curated vector combo for a target class:
 
@@ -93,9 +91,12 @@ A `Preset` is a curated vector combo for a target class:
 | `cdn` | tls_exhaust + h2_rapid_reset + http_flood | origin-behind-edge |
 | `dns` | dns_flood + udp_flood | |
 
-`build_config(preset, tier, target, …)` stamps the tier's concurrency onto every
+`build_config(preset, target, …)` stamps `PRESET_CONCURRENCY` (2700) onto every
 vector and returns a normal `RunConfig` — which you can dump, hand-edit, and
-re-run. Presets are a starting point, never a black box.
+re-run. Presets are a starting point, never a black box. There is no
+aggressiveness ladder: presets always run at full pressure, tuned down from a
+naive 3000 so one origin exhausts the target's state table before its own local
+socket limits.
 
 ---
 
@@ -110,9 +111,8 @@ re-run. Presets are a starting point, never a black box.
 2. Classifies into `TargetKind`: `RouterHost | Dns | Cdn | Api | Web | Unknown`.
    Private/loopback IPs and embedded servers → `RouterHost` even if they serve a
    web UI (a home router's admin page is not a "web app").
-3. **`recommend(char, root)`** — maps the kind to a preset + tier with
-   human-readable reasoning, then hands the built plan to the normal
-   consent/confirm path.
+3. **`recommend(char, root)`** — maps the kind to a preset with human-readable
+   reasoning, then hands the built plan to the normal consent/confirm path.
 
 ---
 
@@ -143,16 +143,30 @@ allocation, O(1) recording, prompt cooperative shutdown.
 ### 8.1 Shared state (`engine/mod.rs`)
 
 - **`Metrics`** — all counters are `AtomicU64/U32` with `Relaxed` ordering
-  (`requests_sent`, `responses_ok`, `errors`, `bytes_sent`, `held_connections`,
-  and per-class HTTP status counters `http_2xx/3xx/4xx/403/429/5xx`) plus a
-  latency `Histogram`. No mutex is touched per request.
+  (`requests_sent`, `responses_ok`, `packets_sent`, `errors`, `bytes_sent`,
+  `held_connections`, and per-class HTTP status counters
+  `http_2xx/3xx/4xx/403/429/5xx`) plus a latency `Histogram`. No mutex is touched
+  per request. **One `Metrics` instance per vector** — the sampler and summary
+  aggregate across them, but each governor sees only its own vector's counters,
+  so a distressed vector never throttles a healthy one. `responses_ok` means a
+  real round-trip/handshake; connectionless floods (UDP/DNS/ICMP/raw) increment
+  `packets_sent` (local egress, *not* confirmed delivery) so their send rate is
+  never reported as target throughput.
 - **`Shutdown`** — a `tokio::sync::watch<bool>`. Cheap `is_down()` reads, and
   `subscribe()` gives each worker a receiver it races in `select!` — no
-  lost-notification window.
+  lost-notification window. Unbounded reads (HTTP/2 response, HTTP header read)
+  race it too, and `run()` force-aborts any straggler after a 5 s drain grace, so
+  stopping the process always stops the traffic.
 - **`Governor`** (per vector) — an `AtomicU32 target_concurrency` that workers
   gate on with a single relaxed load (`idx < target`). `govern()` ramps it 0→max
   over the ramp-up; in `Adaptive` mode it halves under distress (error rate
   > 0.5) and re-grows — that back-off/re-grow cycle is what measures recovery.
+  Fire-and-forget vectors (no target feedback) just ramp; they never fake an
+  adaptive decision off a local send count.
+- **fd preflight** — before spawning, `fd_scale()` reads `RLIMIT_NOFILE`, tries to
+  raise the soft limit toward the hard cap, and scales total concurrency down to
+  fit if it still won't (with a warning). Prevents EMFILE storms that would read
+  as target failures but are really our own socket table.
 - **`HeldGuard`** — RAII inc/dec of `held_connections`, so the count follows
   connection lifetime exactly even on early return.
 
@@ -166,21 +180,34 @@ the sampler (4×/s) on **windowed deltas** so the collapse curve reflects latenc
 
 ### 8.3 Sampler & outcome
 
-`sample()` runs every 250 ms: snapshots the histogram, computes windowed
-p50/p95/p99, RPS and error-rate deltas, and appends a `LatencySample` to the
-collapse curve. After the run, `derive_outcome()` extracts baseline p99 (from
-recon if available), **time-to-degradation**, the knee, and **recovery time** —
-degradation requires both a 3× ratio **and** an absolute delta > 25 ms
-(`MIN_DEGRADE_DELTA_MS`), so sub-millisecond jitter never registers as a finding.
+`sample()` runs every 250 ms: aggregates every vector's histogram, computes
+windowed p50/p95/p99, and derives RPS + error rate. **RPS is completed responses
+divided by the *actual* elapsed window** (not a nominal 250 ms — a late wakeup
+under load would otherwise distort it); error rate is `errors / (completions +
+errors)`. After the run, `derive_outcome()` extracts baseline p99 (from recon if
+available), **time-to-degradation**, the knee, and **recovery time**. Degradation
+requires a 3× ratio, an absolute delta > 25 ms (`MIN_DEGRADE_DELTA_MS`), **and**
+that both persist for `DEGRADE_CONSECUTIVE` (3) consecutive samples — a lone
+transient spike never registers, and recovery is symmetric.
 
-### 8.4 Health probe — ground truth
+### 8.4 Health probe & service probe — ground truth
 
-`health_probe()` TCP-connects to the target once per second (plus a pre-load
-baseline), independent of the attack traffic. This is the **only** signal that
-works for L4/raw vectors (which produce no application-layer response), and it is
-the classifier's strongest input: if the target stops accepting connections or
-its connect latency blows up *while we're loading it*, that's ground truth that
-we affected it.
+Two independent, DIRECT (never proxied) control-plane observers run alongside the
+load:
+
+- **`health_probe()`** TCP-connects to the target once per second (plus a pre-load
+  baseline). Each connect is classified by *who is at fault*: a success, a RST
+  (`Refused`), a timeout/unreachable (`TargetFail`), or our own socket/port
+  exhaustion (`LocalExhausted`, excluded from any "target down" conclusion). A RST
+  counts as a failure **only if the service was accepting at baseline** —
+  baseline-accepting → load-refused means load knocked the listener over. This is
+  the only signal that works for L4/raw vectors.
+- **`service_probe()`** issues a real independent `GET` once per second (reqwest,
+  cert-agnostic, no redirects) when the app answered at baseline. It catches what
+  a TCP connect cannot: a server whose worker/connection pool is exhausted by
+  slowloris still completes TCP handshakes while answering no real requests. If
+  baseline-healthy service GETs start failing under load, that's a finding even
+  with a stable connect probe.
 
 ### 8.5 `--stop-on-detect` monitor
 
@@ -196,10 +223,18 @@ sees a sustained failure or latency blow-up, it prompts (off the runtime, via
 - **`Target::resolve`** — DNS once, up front; the `SocketAddr` is shared so the
   hot path never resolves. Holds two shared `rustls` connectors (default and
   ALPN-`h2`) built on the ring provider.
+- **SOCKS5 proxy** — when configured, every TCP connection this target makes
+  routes through the proxy (`tcp_stream()` via `tokio-socks`, host sent to the
+  proxy as a name so it resolves — no local DNS leak). Covers all L7 TCP vectors,
+  TLS-exhaust, and TCP-exhaust. **SOCKS5 is TCP-only**: raw L3/L4 and UDP/DNS
+  vectors can't be carried and egress from the host's real address (the engine
+  warns). The health/service probes stay direct by design. Only `socks5://` /
+  `socks5h://` are accepted.
 - Pre-built request templates: rotating browser fingerprints (`build_get_templates`),
   the slowloris partial head, the RUDY POST head, and the CVE-2011-3192 Range
   request — all serialized **once**, so workers never format strings in the loop.
-- `connect_small_window` sets a tiny `SO_RCVBUF` for the Slow Read vector.
+- `connect_small_window` sets a tiny `SO_RCVBUF` for the Slow Read vector (falls
+  back to an ordinary held connection when proxied — SOCKS5 can't set it).
 
 ### 8.7 The 16 vectors
 
@@ -219,8 +254,34 @@ sees a sustained failure or latency blow-up, it prompts (off the runtime, via
 | `raw.rs` + `syn_flood.rs` / `ack_flood.rs` | syn_flood, ack_flood | raw TCP SYN/ACK via pnet (root), real source IP |
 | `icmp_flood.rs` | icmp_flood | ICMP echo flood via pnet (root) |
 
-Raw vectors run their synchronous pnet send loop on a `spawn_blocking` thread and
-read the shared atomics/watch directly.
+Raw vectors run their synchronous send loop on a `spawn_blocking` thread and read
+the shared atomics/watch directly.
+
+### 8.8 Transmit backends (`packet_tx.rs`, `wire.rs`, `l2.rs`, `xdp.rs`)
+
+The stateless SYN/ACK path picks the fastest available transmitter at startup
+behind the `PacketTx` seam, and falls back cleanly so it always runs:
+
+1. **AF_XDP** (`xdp.rs`, only when built `--features xdp`) — pure-`libc`, TX-only:
+   packets go into a shared UMEM and out through an AF_XDP TX ring, so the
+   per-packet `sendto` collapses to **one wakeup syscall per 64-frame batch**
+   (finding F1) and nothing touches the IP stack, netfilter, or conntrack (F2).
+   Best-effort zero-copy; single queue for now (multi-queue sharding = F3, TODO).
+   No libbpf/libxdp — the default build pulls no C toolchain. *Compile-verified;
+   ring offsets/barriers need on-NIC validation.*
+2. **AF_PACKET** (`packet_tx.rs`) — full Ethernet-frame injection via
+   `pnet_datalink`. Same syscall-per-packet cost as the kernel path, but injecting
+   at the driver **bypasses netfilter OUTPUT and local conntrack** (F2) — so a
+   unique-flow flood exhausts the *target's* state table, not our own (which is
+   what capped the earlier router run).
+3. **Kernel Layer-4** (`pnet_transport`) — the original path, kernel builds IP+L2.
+   The always-available fallback when we're not root or L2 can't be resolved.
+
+`wire.rs` builds the Ethernet+IPv4 prefix (checksums included, unit-tested);
+`l2.rs` resolves the egress interface, source MAC, and next-hop MAC from
+`/proc/net/route`, `/proc/net/arp`, and `/sys` (with an ARP nudge), since injecting
+frames means we own Layer 2. The source IP/MAC are hard-bound to this host — the
+full-frame path exposes no spoofing knob.
 
 ---
 
@@ -229,17 +290,22 @@ read the shared atomics/watch directly.
 `classify(Signals, samples) → Classification { verdict, confidence, evidence }`.
 Verdicts, in the order they're checked:
 
-1. **Health probe (ground truth)** — >30% probe failures → `Down`/`Degrading`;
-   probe latency > 3× baseline and > 25 ms → `Degrading`. This runs first and
-   overrides everything, and it's what makes L4 runs classifiable.
-2. **L4-only fallback** — no L7 signal but a stable probe → `Healthy` (absorbed);
+1. **Health probe (ground truth)** — failures counted over *conclusive* checks
+   only (local socket exhaustion excluded; if it dominates, the probe is declared
+   unreliable and we fall through). >30% conclusive failures → `Down`/`Degrading`;
+   probe latency > 3× baseline and > 25 ms → `Degrading`.
+2. **Service probe** — baseline-healthy app now failing > 25% of independent GETs
+   while TCP still accepts → `Degrading`/`Down`. This catches slow-connection
+   exhaustion that a TCP probe alone reads as healthy.
+3. **L4-only fallback** — no L7 signal but a stable probe → `Healthy` (absorbed);
    no probe signal at all → `Unknown`.
-3. **Rate limiter** — ≥20% 429s → `MitigationEngaged`.
-4. **WAF** — ≥20% 403s → `MitigationEngaged`, confidence boosted by a matched
+4. **Rate limiter** — ≥20% 429s → `MitigationEngaged`.
+5. **WAF** — ≥20% 403s → `MitigationEngaged`, confidence boosted by a matched
    `detect_waf` vendor.
-5. **Latency exhaustion** — peak p99 > 3× baseline & > 25 ms → `Degrading`, or
-   `Down` if the tail is near-total failure.
-6. **Healthy** — ≥80% 2xx, stable latency.
+6. **Latency exhaustion** — p99 > 3× baseline & > 25 ms **sustained for 3+
+   consecutive samples** → `Degrading`, or `Down` if the tail is near-total
+   failure.
+7. **Healthy** — ≥80% 2xx, stable latency.
 
 Confidence is always capped at 0.9 — the tool reports likelihood, never proof, so
 it never calls a WAF save a "vuln."

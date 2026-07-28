@@ -47,20 +47,24 @@ pub struct ReconReport {
     pub ranked_endpoints: Vec<Endpoint>,
 }
 
-fn build_client() -> Result<Client> {
-    Client::builder()
+fn build_client(proxy: Option<&crate::config::ProxyConfig>) -> Result<Client> {
+    let mut b = Client::builder()
         // Authorized testing routinely targets self-signed / internal certs.
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(10))
         .user_agent("OpenNetBench-recon/0.1")
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()
-        .context("building recon HTTP client")
+        .redirect(reqwest::redirect::Policy::limited(3));
+    if let Some(p) = proxy {
+        let px = reqwest::Proxy::all(&p.url).context("invalid recon proxy URL")?;
+        b = b.proxy(px);
+    }
+    b.build().context("building recon HTTP client")
 }
 
-/// Run the full recon suite against `base` and return a ranked report.
-pub async fn run_recon(base: &str) -> Result<ReconReport> {
-    let client = build_client()?;
+/// Run the full recon suite against `base` and return a ranked report. When
+/// `proxy` is set, all recon requests route through it.
+pub async fn run_recon(base: &str, proxy: Option<&crate::config::ProxyConfig>) -> Result<ReconReport> {
+    let client = build_client(proxy)?;
 
     let fp = fingerprint::fingerprint(&client, base).await;
     let crawl = crawl::crawl(&client, base, MAX_CRAWL_PAGES, MAX_CRAWL_DEPTH).await;
@@ -124,19 +128,25 @@ async fn measure_endpoint(
         return None;
     }
     let baseline_ms = total_ms / n as f64;
-    let dynamic = dynamic_hint || url.contains('?');
+    // A POST-form discovery usually maps to a dynamic handler, so it boosts the
+    // dynamic score — but we time (and the engine floods) with GET, so we must
+    // NOT claim the POST was tested. Auto-POSTing during recon could also change
+    // server state; recon stays read-only. Report the method actually probed.
+    let dynamic = dynamic_hint || url.contains('?') || !method.eq_ignore_ascii_case("GET");
     let request_bytes = url.len() + 128;
     let asymmetry = score::asymmetry(baseline_ms, request_bytes, cacheable, dynamic);
     Some(Endpoint {
         url: url.to_string(),
-        method: method.to_string(),
+        method: "GET".to_string(),
         cacheable,
         baseline_ms,
         asymmetry,
     })
 }
 
-/// A single timed GET: returns (time-to-headers ms, cacheable).
+/// A single timed GET: returns (time-to-headers ms, cacheable). Recon is
+/// deliberately read-only — it never sends non-GET requests, so it can't mutate
+/// state on the target while measuring it.
 async fn timed_ttfb(client: &Client, url: &str) -> Option<(f64, bool)> {
     let t0 = Instant::now();
     let resp = client.get(url).send().await.ok()?;

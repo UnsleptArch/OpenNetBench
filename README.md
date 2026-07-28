@@ -21,17 +21,28 @@ OpenNetBench fills that gap — scoped to systems you own or are authorized to t
 - **16 vectors, L3→L7** — volumetric, slow-connection, state-exhaustion, protocol
   abuse. Three named CVEs (2023-44487, 2024-27316, 2011-3192).
 - **Auto-engine** — probe a target, characterize it, and get a recommended
-  attack combo + aggressiveness tier with reasoning (`--auto`).
-- **Presets & tiers** — one-command profiles (`router`, `web`, `api`, `cdn`,
-  `dns`, …) across five aggressiveness tiers (`recon`→`brutal`).
-- **Ground-truth classification** — an independent health probe watches the
-  target and the classifier reports `Healthy` / `MitigationEngaged` /
-  `EdgeBlocked` / `Degrading` / `Down` with a confidence and evidence.
+  attack combo with reasoning (`--auto`).
+- **Presets** — one-command profiles (`router`, `web`, `api`, `cdn`, `dns`, …),
+  each running at full pressure. Dump with `--save-config` and edit to dial back.
+- **Ground-truth classification** — two independent observers (a TCP health
+  probe and a real HTTP service probe) watch the target, and the classifier
+  reports `Healthy` / `MitigationEngaged` / `EdgeBlocked` / `Degrading` / `Down`
+  with a confidence and evidence. It tells a target that *crashed* apart from one
+  that our own box couldn't reach, and catches slow-connection exhaustion that
+  still answers TCP.
+- **Honest per-vector metrics** — RPS is completed responses over the real
+  elapsed window; connectionless floods report a separate send rate, never faked
+  as delivered load; each vector self-throttles on its own signal.
 - **Real measurement** — the collapse curve (windowed p50/p95/p99 vs load),
   time-to-degradation, the knee, and **recovery time** — the metric almost
   nobody measures, and gold for blue teams.
+- **SOCKS5 proxy** — route the TCP load path (and recon) through a SOCKS5 proxy
+  (e.g. Tor) via the interactive prompt or a config file. Raw L3/L4 and UDP can't
+  be proxied and egress directly (the tool warns); the probes stay direct.
+- **Fits the host** — reads `RLIMIT_NOFILE` and scales concurrency to fit, so it
+  stresses the target instead of exhausting its own sockets.
 - **Fast and lean** — lock-free atomics, a fixed 4 KB latency histogram, zero
-  per-request allocation, prompt cooperative shutdown.
+  per-request allocation, bounded shutdown that always stops the traffic.
 
 ---
 
@@ -63,17 +74,17 @@ opennetbench
 # See what's available
 opennetbench --list-presets
 
-# Auto: probe the target, recommend a combo + tier, then run it
+# Auto: probe the target, recommend a combo, then run it
 opennetbench --auto --target example.com --duration 60
 
-# Preset + tier, one shot
-opennetbench --preset web --tier moderate --target https://example.com --duration 60
+# Preset, one shot
+opennetbench --preset web --target https://example.com --duration 60
 
 # Router / gateway state-exhaustion (raw sockets → sudo)
-sudo opennetbench --preset router --tier aggressive --target 192.168.1.254 --duration 40
+sudo opennetbench --preset router --target 192.168.1.254 --duration 40
 
 # Generate an editable plan without running it
-opennetbench --preset api --tier aggressive --target https://api.example.com --save-config api.json
+opennetbench --preset api --target https://api.example.com --save-config api.json
 opennetbench --config api.json     # run it later (edit the JSON freely)
 ```
 
@@ -86,13 +97,13 @@ default to `https://`.
 | Flag | Effect |
 |---|---|
 | `--auto` | probe → characterize → recommend → run |
-| `--preset <name> --tier <tier>` | run a built-in combo |
+| `--preset <name>` | run a built-in combo |
 | `--target <url\|ip>` | the target |
 | `--duration <s>` / `--rampup <s>` | run length / ramp (0 duration = until stopped) |
 | `--auto-approve` | let recon auto-pick the top target (no prompt) |
 | `--stop-on-detect` | pause and ask to stop the moment a finding appears (off = full duration) |
 | `--save-config <file>` | write the resolved plan to JSON and exit |
-| `--list-presets` | list presets and tiers |
+| `--list-presets` | list presets |
 
 ---
 
@@ -116,8 +127,9 @@ default to `https://`.
 | `dns_flood` | L7 | random-subdomain query flood |
 | `icmp_flood` | L3 | ICMP echo flood (root) |
 
-**Tiers:** `recon` (probe only) · `light` (50/vector) · `moderate` (200) ·
-`aggressive` (800) · `brutal` (3000).
+**Load level:** presets run at a single fixed pressure (2700 workers/vector).
+Tune per-vector concurrency by dumping with `--save-config` and editing the JSON,
+or use the interactive flow's per-vector prompts.
 
 ---
 
@@ -164,7 +176,7 @@ environments, CTFs, or client infrastructure you're engaged to assess.
 
 ## Status
 
-**Beta v1.** The engine, vectors, recon, auto-engine, presets/tiers, health
+**Beta v1.** The engine, vectors, recon, auto-engine, presets, health
 probe, and classifier are complete and tested. On the roadmap: the live
 dashboard (animated collapse curve + findings), SQLite run history, and CVE
 correlation.

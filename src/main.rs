@@ -24,7 +24,6 @@ mod web;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use config::Tier;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -38,7 +37,7 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Auto-engine: probe --target, characterize it, recommend a preset + tier,
+    /// Auto-engine: probe --target, characterize it, recommend a preset,
     /// then run it (after the normal consent + confirm).
     #[arg(long)]
     auto: bool,
@@ -57,10 +56,6 @@ struct Args {
     #[arg(long, value_name = "NAME")]
     preset: Option<String>,
 
-    /// Aggressiveness tier for a preset: recon|light|moderate|aggressive|brutal.
-    #[arg(long, default_value = "moderate")]
-    tier: String,
-
     /// Target URL or IP (bare IPs get http:// assumed for presets).
     #[arg(long)]
     target: Option<String>,
@@ -73,7 +68,7 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     rampup: u64,
 
-    /// List available presets and tiers, then exit.
+    /// List available presets, then exit.
     #[arg(long)]
     list_presets: bool,
 
@@ -149,7 +144,6 @@ async fn main() -> Result<()> {
         let preset = presets::find(rec.preset).expect("recommended preset must exist");
         let cfg = presets::build_config(
             preset,
-            rec.tier,
             target,
             None,
             std::time::Duration::from_secs(args.duration),
@@ -182,7 +176,7 @@ async fn main() -> Result<()> {
     };
     if cfg.run_recon {
         info!(target = %cfg.target, "recon: starting");
-        match recon::run_recon(&cfg.target).await {
+        match recon::run_recon(&cfg.target, cfg.proxy.as_ref()).await {
             Ok(report) => {
                 cli::present_recon(&report);
                 ctx.waf_vendor = classify::detect_waf(report.server_fingerprint.as_deref());
@@ -225,12 +219,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolve --preset/--tier/--target into a runnable config.
+/// Resolve --preset/--target into a runnable config.
 fn build_preset_config(args: &Args, name: &str) -> Result<config::RunConfig> {
     let preset = presets::find(name)
         .ok_or_else(|| anyhow!("unknown preset '{name}' — see --list-presets"))?;
-    let tier = Tier::parse(&args.tier)
-        .ok_or_else(|| anyhow!("unknown tier '{}' — see --list-presets", args.tier))?;
     let target = args
         .target
         .as_deref()
@@ -241,7 +233,6 @@ fn build_preset_config(args: &Args, name: &str) -> Result<config::RunConfig> {
     }
     Ok(presets::build_config(
         preset,
-        tier,
         target,
         None,
         std::time::Duration::from_secs(args.duration),
@@ -267,16 +258,17 @@ extern "C" {
 }
 
 fn print_presets() {
-    println!("Presets (use --preset <name> --target <url|ip> [--tier <tier>]):\n");
+    println!("Presets (use --preset <name> --target <url|ip>):\n");
     for p in presets::PRESETS {
         let sudo = if p.needs_root { "  [sudo]" } else { "" };
         println!("  {:<12} {}{}", p.name, p.description, sudo);
     }
-    println!("\nTiers (--tier):\n");
-    for t in Tier::ALL {
-        println!("  {:<12} {}", t.slug(), t.description());
-    }
-    println!("\nExample:");
-    println!("  sudo ./opennetbench --preset router --tier aggressive --target 192.168.1.254 --duration 40");
-    println!("  ./opennetbench --preset web --tier moderate --target https://example.com --save-config web.json");
+    println!(
+        "\nAll presets hit at full pressure ({} workers/vector). Dump with --save-config",
+        presets::PRESET_CONCURRENCY
+    );
+    println!("and edit the JSON to dial it back.\n");
+    println!("Example:");
+    println!("  sudo ./opennetbench --preset router --target 192.168.1.254 --duration 40");
+    println!("  ./opennetbench --preset web --target https://example.com --save-config web.json");
 }

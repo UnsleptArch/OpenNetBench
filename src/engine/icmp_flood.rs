@@ -82,7 +82,8 @@ fn run_blocking(
         match tx.send_to(pkt, IpAddr::V4(dst_ip)) {
             Ok(n) => {
                 metrics.bytes_sent.fetch_add(n as u64, Relaxed);
-                metrics.responses_ok.fetch_add(1, Relaxed);
+                // Local raw send accepted — NOT an echo reply. See Metrics::packets_sent.
+                metrics.packets_sent.fetch_add(1, Relaxed);
             }
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);

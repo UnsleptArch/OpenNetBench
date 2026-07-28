@@ -4,6 +4,7 @@
 //! box, no vtable in the I/O path. Both variants are `Unpin`, so the
 //! `AsyncRead`/`AsyncWrite` delegation needs no pin projection.
 
+use crate::config::ProxyConfig;
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -16,8 +17,39 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use tokio_socks::tcp::Socks5Stream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A parsed SOCKS5 proxy the TCP load path dials through.
+pub struct ProxySpec {
+    addr: SocketAddr,
+    auth: Option<(String, String)>,
+}
+
+impl ProxySpec {
+    /// Parse a `socks5://[user:pass@]host:port` (or `socks5h://`) URL. Only
+    /// SOCKS5 is supported — it is the only scheme that can carry arbitrary TCP.
+    async fn parse(cfg: &ProxyConfig) -> Result<ProxySpec> {
+        let url = url::Url::parse(&cfg.url).context("parsing proxy URL")?;
+        match url.scheme() {
+            "socks5" | "socks5h" => {}
+            other => return Err(anyhow!("unsupported proxy scheme '{other}' (use socks5://)")),
+        }
+        let host = url.host_str().ok_or_else(|| anyhow!("proxy URL has no host"))?;
+        let port = url.port().ok_or_else(|| anyhow!("proxy URL has no port"))?;
+        let addr = tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("resolving proxy {host}:{port}"))?
+            .next()
+            .ok_or_else(|| anyhow!("no address for proxy {host}:{port}"))?;
+        let auth = match (url.username(), url.password()) {
+            ("", None) => None,
+            (u, p) => Some((u.to_string(), p.unwrap_or("").to_string())),
+        };
+        Ok(ProxySpec { addr, auth })
+    }
+}
 
 /// Fully-resolved target. DNS is done once, up front, and the `SocketAddr` is
 /// shared by every worker so the hot path never resolves.
@@ -31,11 +63,14 @@ pub struct Target {
     pub connector: TlsConnector,
     /// TLS connector advertising ALPN `h2`, for the HTTP/2 rapid-reset vector.
     pub h2_connector: TlsConnector,
+    /// SOCKS5 proxy for the TCP load path, if configured.
+    proxy: Option<ProxySpec>,
 }
 
 impl Target {
-    /// Resolve a target URL into a reusable `Target` (DNS once).
-    pub async fn resolve(url_str: &str) -> Result<Self> {
+    /// Resolve a target URL into a reusable `Target` (DNS once). `proxy`, when
+    /// set, routes every TCP connection this target makes through SOCKS5.
+    pub async fn resolve(url_str: &str, proxy: Option<&ProxyConfig>) -> Result<Self> {
         let url = url::Url::parse(url_str).context("parsing target URL")?;
         let tls = matches!(url.scheme(), "https");
         let host = url
@@ -60,6 +95,11 @@ impl Target {
         let server_name = ServerName::try_from(host.clone())
             .context("target host is not a valid TLS server name")?;
 
+        let proxy = match proxy {
+            Some(cfg) => Some(ProxySpec::parse(cfg).await?),
+            None => None,
+        };
+
         Ok(Target {
             tls,
             host,
@@ -68,13 +108,57 @@ impl Target {
             server_name,
             connector: build_connector(&[]),
             h2_connector: build_connector(&[b"h2".to_vec()]),
+            proxy,
         })
+    }
+
+    /// Whether this target's TCP connections go through a proxy.
+    pub fn is_proxied(&self) -> bool {
+        self.proxy.is_some()
+    }
+
+    /// Open the base TCP stream to the target: directly, or via SOCKS5 when a
+    /// proxy is configured. When proxied, the target host is sent to the proxy
+    /// as a name so the proxy resolves it (no local DNS leak; supports egress
+    /// that can reach names we can't).
+    async fn tcp_stream(&self) -> Result<TcpStream> {
+        match &self.proxy {
+            None => {
+                let s = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr))
+                    .await
+                    .context("connect timed out")??;
+                Ok(s)
+            }
+            Some(p) => {
+                let port = self.addr.port();
+                let target = (self.host.as_str(), port);
+                let fut = async {
+                    match &p.auth {
+                        Some((u, pw)) => {
+                            Socks5Stream::connect_with_password(p.addr, target, u, pw).await
+                        }
+                        None => Socks5Stream::connect(p.addr, target).await,
+                    }
+                };
+                let stream = tokio::time::timeout(CONNECT_TIMEOUT, fut)
+                    .await
+                    .context("proxy connect timed out")?
+                    .context("SOCKS5 proxy connection failed")?;
+                Ok(stream.into_inner())
+            }
+        }
     }
 
     /// Open a connection with a deliberately small OS receive buffer, so our
     /// advertised TCP window is tiny — the mechanism behind the Slow Read
     /// vector (server can't flush its response, holds the connection open).
+    /// The small-window trick requires setting the option on our own socket
+    /// before connecting, which SOCKS5 doesn't allow — so a proxied Slow Read
+    /// falls back to an ordinary held connection through the proxy.
     pub async fn connect_small_window(&self, rcvbuf: u32) -> Result<Conn> {
+        if self.is_proxied() {
+            return self.connect().await;
+        }
         let socket = if self.addr.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
@@ -101,9 +185,7 @@ impl Target {
     /// Open one TLS connection with ALPN `h2` negotiated, returning the raw
     /// stream for the h2 client handshake. Used by the rapid-reset vector.
     pub async fn connect_h2(&self) -> Result<TlsStream<TcpStream>> {
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr))
-            .await
-            .context("connect timed out")??;
+        let tcp = self.tcp_stream().await?;
         tcp.set_nodelay(true).ok();
         let stream = tokio::time::timeout(
             CONNECT_TIMEOUT,
@@ -114,11 +196,17 @@ impl Target {
         Ok(stream)
     }
 
+    /// Open a raw TCP stream to the target (proxy-aware), for the vectors that
+    /// want a bare connection: TCP-exhaust holds it, TLS-exhaust handshakes on it.
+    pub async fn connect_tcp(&self) -> Result<TcpStream> {
+        let tcp = self.tcp_stream().await?;
+        tcp.set_nodelay(true).ok();
+        Ok(tcp)
+    }
+
     /// Open one connection (TCP, plus TLS handshake when applicable).
     pub async fn connect(&self) -> Result<Conn> {
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr))
-            .await
-            .context("connect timed out")??;
+        let tcp = self.tcp_stream().await?;
         tcp.set_nodelay(true).ok();
         if self.tls {
             let stream = tokio::time::timeout(

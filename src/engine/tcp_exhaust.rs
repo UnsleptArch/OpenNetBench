@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 
 pub async fn worker(
     idx: u32,
@@ -39,7 +38,7 @@ pub async fn worker(
         // cause of the multi-second shutdown drain. Cap it and race it against
         // the stop signal.
         let mut stream = tokio::select! {
-            r = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target.addr)) => {
+            r = tokio::time::timeout(Duration::from_secs(5), target.connect_tcp()) => {
                 match r {
                     Ok(Ok(s)) => s,
                     _ => {

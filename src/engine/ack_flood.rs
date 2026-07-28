@@ -10,12 +10,18 @@ use super::{Governor, Metrics, Shutdown};
 use pnet_packet::tcp::TcpFlags;
 use std::sync::Arc;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn worker(
     idx: u32,
     target: Arc<Target>,
     metrics: Arc<Metrics>,
     gov: Arc<Governor>,
     shutdown: Arc<Shutdown>,
+    queue_rank: u32,
+    queue_groups: u32,
 ) {
-    super::raw::tcp_flag_flood(idx, target, metrics, gov, shutdown, TcpFlags::ACK, "ack_flood").await;
+    super::raw::tcp_flag_flood(
+        idx, target, metrics, gov, shutdown, TcpFlags::ACK, "ack_flood", queue_rank, queue_groups,
+    )
+    .await;
 }

@@ -10,7 +10,6 @@ use super::{Governor, Metrics, Shutdown};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 
 pub async fn worker(
     idx: u32,
@@ -36,14 +35,13 @@ pub async fn worker(
         let t0 = Instant::now();
         metrics.requests_sent.fetch_add(1, Relaxed);
 
-        let tcp = match TcpStream::connect(target.addr).await {
+        let tcp = match target.connect_tcp().await {
             Ok(s) => s,
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);
                 continue;
             }
         };
-        tcp.set_nodelay(true).ok();
 
         match target
             .connector

@@ -63,7 +63,8 @@ pub async fn worker(
         match sock.send(&payload).await {
             Ok(n) => {
                 metrics.bytes_sent.fetch_add(n as u64, Relaxed);
-                metrics.responses_ok.fetch_add(1, Relaxed);
+                // Local send accepted — NOT a target response. See Metrics::packets_sent.
+                metrics.packets_sent.fetch_add(1, Relaxed);
             }
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);

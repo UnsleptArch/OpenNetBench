@@ -1,11 +1,19 @@
 //! Pre-built target profiles.
 //!
-//! A preset is a curated vector combo for a kind of target; an aggressiveness
-//! `Tier` scales how hard it hits. Together they build a ready `RunConfig` the
-//! operator can still edit (dump to JSON, tweak, re-run with --config).
+//! A preset is a curated vector combo for a kind of target. It builds a ready
+//! `RunConfig` the operator can still edit (dump to JSON, tweak, re-run with
+//! --config). There is a single, deliberately hard load level — presets always
+//! hit at full pressure; dial it back by editing the saved config if needed.
 
-use crate::config::{ProxyConfig, RunConfig, RunMode, Tier, Vector, VectorPlan, VectorTuning};
+use crate::config::{ProxyConfig, RunConfig, RunMode, Vector, VectorPlan, VectorTuning};
 use std::time::Duration;
+
+/// Per-vector worker concurrency every preset applies. Tuned down from a naive
+/// 3000: past a few thousand held connections a single origin exhausts its own
+/// ephemeral ports / conntrack before it stresses the target, which is exactly
+/// what produced false "target down" reads. ~2700 keeps real pressure on the
+/// target's state table while staying inside one box's local limits.
+pub const PRESET_CONCURRENCY: u32 = 2700;
 
 pub struct Preset {
     pub name: &'static str,
@@ -82,24 +90,21 @@ pub fn find(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.name == n)
 }
 
-/// Build a runnable config from a preset + tier + target. Every vector gets the
-/// tier's base concurrency; `Recon` tier produces no flood (concurrency 0) but
-/// still runs recon + the health probe.
+/// Build a runnable config from a preset + target. Every vector gets
+/// [`PRESET_CONCURRENCY`]; the operator can still dump to JSON and edit.
 pub fn build_config(
     preset: &Preset,
-    tier: Tier,
     target: String,
     proxy: Option<ProxyConfig>,
     duration: Duration,
     rampup: Duration,
 ) -> RunConfig {
-    let concurrency = tier.concurrency();
     let vectors = preset
         .vectors
         .iter()
         .map(|&v| {
             let mut tuning = VectorTuning::defaults_for(v);
-            tuning.concurrency = concurrency;
+            tuning.concurrency = PRESET_CONCURRENCY;
             VectorPlan { vector: v, tuning }
         })
         .collect();
@@ -108,8 +113,7 @@ pub fn build_config(
         target,
         proxy,
         mode: preset.mode,
-        // Recon tier is recon-only; otherwise honor the preset's choice.
-        run_recon: preset.run_recon || tier == Tier::Recon,
+        run_recon: preset.run_recon,
         vectors,
         duration,
         rampup,

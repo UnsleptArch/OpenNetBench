@@ -13,6 +13,37 @@ use serde::{Deserialize, Serialize};
 /// localhost 0.2ms→1.7ms); real exhaustion moves p99 by tens of ms or more.
 pub const MIN_DEGRADE_DELTA_MS: f64 = 25.0;
 
+/// How many consecutive samples (at 250 ms each) must breach the degradation
+/// threshold before it counts. Filters transient spikes (a scheduler pause, one
+/// GC) from genuine sustained exhaustion. 3 samples ≈ 0.75 s.
+pub const DEGRADE_CONSECUTIVE: usize = 3;
+
+/// The peak p99 within any run of at least [`DEGRADE_CONSECUTIVE`] consecutive
+/// samples that breached both the 3× ratio and the absolute delta over baseline.
+/// `None` if no such sustained run exists (i.e. only transient spikes).
+pub fn sustained_high_p99(samples: &[LatencySample], base: f64) -> Option<f64> {
+    if base <= 0.0 {
+        return None;
+    }
+    let mut run = 0usize;
+    let mut run_peak = 0.0f64;
+    let mut best: Option<f64> = None;
+    for s in samples {
+        let breached = s.p99_ms > base * 3.0 && s.p99_ms - base > MIN_DEGRADE_DELTA_MS;
+        if breached {
+            run += 1;
+            run_peak = run_peak.max(s.p99_ms);
+            if run >= DEGRADE_CONSECUTIVE {
+                best = Some(best.map_or(run_peak, |b| b.max(run_peak)));
+            }
+        } else {
+            run = 0;
+            run_peak = 0.0;
+        }
+    }
+    best
+}
+
 /// What the observed behavior most likely means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,12 +122,24 @@ pub struct Signals {
     pub probe_baseline_ms: Option<f64>,
     /// Worst connect latency (ms) observed during the run.
     pub probe_peak_ms: Option<f64>,
-    /// Number of health probes that failed (timeout/refused).
+    /// Number of health probes that failed target-side (timeout/unreachable).
     pub probe_failures: u32,
+    /// Health probes that failed on *our* local socket/port exhaustion — these say
+    /// nothing about the target and must not drive a "down" verdict.
+    pub probe_local_inconclusive: u32,
     /// Total health probes attempted.
     pub probe_total: u32,
     /// Peak concurrent held connections observed.
     pub peak_held: u32,
+    // Independent application-layer probe (real GETs from a separate client).
+    /// Whether the service answered normally BEFORE load started. When false the
+    /// service signal is unusable and must be ignored.
+    pub service_baseline_ok: bool,
+    /// Independent service GETs that got no usable answer (timeout / connect
+    /// failure / 5xx) during the run.
+    pub service_failures: u32,
+    /// Total independent service GETs attempted during the run.
+    pub service_checks: u32,
 }
 
 /// Known WAF/CDN vendor substrings to look for in a `Server` header.
@@ -132,37 +175,82 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     // rest when it shows real impact.
     if sig.probe_total > 0 {
         if let Some(base) = sig.probe_baseline_ms {
-            let fail_frac = sig.probe_failures as f64 / sig.probe_total as f64;
-            let peak = sig.probe_peak_ms.unwrap_or(base);
-            if fail_frac > 0.3 {
+            // Probes that failed because *we* ran out of local sockets/ports say
+            // nothing about the target. If they dominate, the probe is unreliable
+            // this run — don't let it decide anything; note it and fall through.
+            let local = sig.probe_local_inconclusive;
+            let conclusive = sig.probe_total.saturating_sub(local);
+            if local * 2 > sig.probe_total {
                 ev.push(format!(
-                    "health probe: {:.0}% of connection checks to the target FAILED under load",
-                    fail_frac * 100.0
+                    "health probe unreliable: {}/{} checks failed on LOCAL socket exhaustion \
+                     (our machine, not the target) — reduce per-vector concurrency for a clean read",
+                    local, sig.probe_total
                 ));
-                let verdict = if fail_frac > 0.7 { Verdict::Down } else { Verdict::Degrading };
-                return Classification {
-                    verdict,
-                    confidence: (0.6 + fail_frac * 0.3).min(0.9),
-                    evidence: ev,
-                };
-            }
-            if base > 0.0 && peak > base * 3.0 && peak - base > MIN_DEGRADE_DELTA_MS {
+            } else if conclusive > 0 {
+                let fail_frac = sig.probe_failures as f64 / conclusive as f64;
+                let peak = sig.probe_peak_ms.unwrap_or(base);
+                if fail_frac > 0.3 {
+                    ev.push(format!(
+                        "health probe: {:.0}% of conclusive connection checks to the target \
+                         FAILED under load",
+                        fail_frac * 100.0
+                    ));
+                    if local > 0 {
+                        ev.push(format!("({local} further checks were inconclusive — local limits)"));
+                    }
+                    let verdict = if fail_frac > 0.7 { Verdict::Down } else { Verdict::Degrading };
+                    return Classification {
+                        verdict,
+                        confidence: (0.6 + fail_frac * 0.3).min(0.9),
+                        evidence: ev,
+                    };
+                }
+                if base > 0.0 && peak > base * 3.0 && peak - base > MIN_DEGRADE_DELTA_MS {
+                    ev.push(format!(
+                        "health probe connect latency rose {base:.1}ms → {peak:.1}ms under load ({:.1}x)",
+                        peak / base
+                    ));
+                    return Classification {
+                        verdict: Verdict::Degrading,
+                        confidence: 0.8,
+                        evidence: ev,
+                    };
+                }
                 ev.push(format!(
-                    "health probe connect latency rose {base:.1}ms → {peak:.1}ms under load ({:.1}x)",
-                    peak / base
+                    "health probe stable ({base:.1}ms baseline, {}/{} conclusive checks ok)",
+                    conclusive - sig.probe_failures,
+                    conclusive
                 ));
-                return Classification {
-                    verdict: Verdict::Degrading,
-                    confidence: 0.8,
-                    evidence: ev,
-                };
             }
-            ev.push(format!(
-                "health probe stable ({base:.1}ms baseline, {}/{} checks ok)",
-                sig.probe_total - sig.probe_failures,
-                sig.probe_total
-            ));
         }
+    }
+
+    // 0b. Service-level health — the signal a TCP connect cannot give. A server
+    // whose worker/connection pool is exhausted (slowloris, rudy, slow read)
+    // still completes TCP handshakes while answering no real requests, so a
+    // stable connect probe alone would read "healthy". This runs only when the
+    // app answered at baseline, and only reaches here when the TCP probe didn't
+    // already return a verdict — i.e. TCP looked fine.
+    if sig.service_baseline_ok && sig.service_checks > 0 {
+        let sfail = sig.service_failures as f64 / sig.service_checks as f64;
+        if sfail > 0.25 {
+            ev.push(format!(
+                "service probe: {:.0}% of independent requests got no usable answer under load, \
+                 while the target still accepted TCP connections",
+                sfail * 100.0
+            ));
+            let verdict = if sfail > 0.6 { Verdict::Down } else { Verdict::Degrading };
+            return Classification {
+                verdict,
+                confidence: (0.6 + sfail * 0.3).min(0.9),
+                evidence: ev,
+            };
+        }
+        ev.push(format!(
+            "service probe healthy ({}/{} independent requests answered)",
+            sig.service_checks - sig.service_failures,
+            sig.service_checks
+        ));
     }
 
     if !sig.l7_active {
@@ -220,14 +308,16 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     }
 
     // 3. Resource exhaustion — p99 blew past baseline under load, by both a
-    // meaningful ratio AND a meaningful absolute amount (filters sub-ms noise).
+    // meaningful ratio AND a meaningful absolute amount (filters sub-ms noise),
+    // AND for a SUSTAINED window (a single transient spike is not degradation).
     if let Some(base) = base {
-        if base > 0.0 && peak_p99 > base * 3.0 && peak_p99 - base > MIN_DEGRADE_DELTA_MS {
+        if let Some(sustained_p99) = sustained_high_p99(samples, base) {
             ev.push(format!(
-                "p99 reached {:.1}ms vs {:.1}ms baseline ({:.1}x)",
-                peak_p99,
+                "p99 held at {:.1}ms vs {:.1}ms baseline ({:.1}x) for {}+ consecutive samples",
+                sustained_p99,
                 base,
-                peak_p99 / base
+                sustained_p99 / base,
+                DEGRADE_CONSECUTIVE
             ));
             // Down if the tail shows near-total failure; else degrading.
             if tail_err > 0.8 || (responses > 0 && sig.http_5xx as f64 / responses as f64 > 0.5) {
@@ -329,8 +419,12 @@ mod tests {
             probe_baseline_ms: None,
             probe_peak_ms: None,
             probe_failures: 0,
+            probe_local_inconclusive: 0,
             probe_total: 0,
             peak_held: 0,
+            service_baseline_ok: false,
+            service_failures: 0,
+            service_checks: 0,
         }
     }
 
@@ -365,10 +459,32 @@ mod tests {
     fn p99_blowout_is_degrading_finding() {
         let mut s = base_signals();
         s.http_2xx = 1000;
-        let samples = [sample(10.0, 0.0), sample(120.0, 0.1)]; // 12x baseline
+        // Sustained 12× breach (3+ consecutive samples), not a single spike.
+        let samples = [
+            sample(10.0, 0.0),
+            sample(120.0, 0.1),
+            sample(120.0, 0.1),
+            sample(120.0, 0.1),
+        ];
         let c = classify(&s, &samples);
         assert_eq!(c.verdict, Verdict::Degrading);
         assert!(c.verdict.is_finding());
+    }
+
+    #[test]
+    fn single_p99_spike_is_not_a_finding() {
+        let mut s = base_signals();
+        s.http_2xx = 1000;
+        // One transient spike surrounded by healthy samples must NOT be Degrading.
+        let samples = [
+            sample(10.0, 0.0),
+            sample(200.0, 0.0), // lone spike
+            sample(11.0, 0.0),
+            sample(12.0, 0.0),
+        ];
+        let c = classify(&s, &samples);
+        assert_ne!(c.verdict, Verdict::Degrading);
+        assert_ne!(c.verdict, Verdict::Down);
     }
 
     #[test]
@@ -403,6 +519,58 @@ mod tests {
         s.probe_total = 10;
         s.probe_failures = 9;
         assert_eq!(classify(&s, &[]).verdict, Verdict::Down);
+    }
+
+    #[test]
+    fn service_dead_while_tcp_accepts_is_a_finding() {
+        // Slowloris case: TCP connect stays healthy, but the app answers no
+        // independent requests. The service probe must catch this, not report
+        // Healthy just because the port still accepts.
+        let mut s = base_signals();
+        s.l7_active = false; // slowloris produces no HTTP status codes itself
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_total = 30;
+        s.probe_failures = 0; // TCP still accepting
+        s.service_baseline_ok = true;
+        s.service_checks = 20;
+        s.service_failures = 18; // 90% of real requests unanswered
+        let c = classify(&s, &[]);
+        assert_eq!(c.verdict, Verdict::Down);
+        assert!(c.verdict.is_finding());
+    }
+
+    #[test]
+    fn service_probe_ignored_when_baseline_down() {
+        // If the service never answered at baseline, its failures say nothing —
+        // must not fabricate a finding on a pure-L4 target.
+        let mut s = base_signals();
+        s.l7_active = false;
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_total = 10;
+        s.probe_failures = 0;
+        s.peak_held = 500;
+        s.service_baseline_ok = false;
+        s.service_checks = 10;
+        s.service_failures = 10;
+        let c = classify(&s, &[]);
+        assert_ne!(c.verdict, Verdict::Down);
+        assert_ne!(c.verdict, Verdict::Degrading);
+    }
+
+    #[test]
+    fn local_socket_exhaustion_does_not_read_as_target_down() {
+        // The router false-positive: our own box ran out of ephemeral ports, so
+        // most probes failed locally. That must NOT be reported as the target
+        // going down — it should fall through, not return Down/Degrading.
+        let mut s = base_signals();
+        s.l7_active = false; // L4-style run, probe is the only signal
+        s.probe_baseline_ms = Some(9.6);
+        s.probe_total = 30;
+        s.probe_local_inconclusive = 28; // 28/30 failed on our sockets
+        s.probe_failures = 2; // only 2 genuine target-side failures
+        let c = classify(&s, &[]);
+        assert_ne!(c.verdict, Verdict::Down);
+        assert_ne!(c.verdict, Verdict::Degrading);
     }
 
     #[test]

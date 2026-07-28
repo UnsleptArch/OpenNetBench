@@ -1,10 +1,9 @@
 //! Auto-engine: probe a target, characterize what it is, and recommend a preset
-//! + aggressiveness tier with reasoning. Recommend-and-approve: it never fires
-//! on its own — it builds the plan and hands it to the normal consent/confirm
-//! path, and the plan is fully editable (dump with --save-config).
+//! with reasoning. Recommend-and-approve: it never fires on its own — it builds
+//! the plan and hands it to the normal consent/confirm path, and the plan is
+//! fully editable (dump with --save-config).
 
 use crate::classify::detect_waf;
-use crate::config::Tier;
 use reqwest::Client;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -56,7 +55,6 @@ pub struct Characterization {
 
 pub struct Recommendation {
     pub preset: &'static str,
-    pub tier: Tier,
     pub reasoning: Vec<String>,
 }
 
@@ -167,11 +165,11 @@ pub async fn characterize(target: &str) -> Characterization {
     }
 }
 
-/// Recommend a preset + tier from the characterization. `root` gates raw-socket
+/// Recommend a preset from the characterization. `root` gates raw-socket
 /// vectors (SYN/ACK) for router targets.
 pub fn recommend(c: &Characterization, root: bool) -> Recommendation {
     let mut reasoning = Vec::new();
-    let (preset, tier) = match c.kind {
+    let preset = match c.kind {
         TargetKind::RouterHost => {
             reasoning.push(format!(
                 "{} looks like router/appliance infrastructure — attack the connection/state table, not bandwidth (one host can't out-bandwidth it, but state tables are small)",
@@ -179,37 +177,37 @@ pub fn recommend(c: &Characterization, root: bool) -> Recommendation {
             ));
             if root {
                 reasoning.push("running as root: SYN + ACK + connection-hold combo available".into());
-                ("router", Tier::Aggressive)
+                "router"
             } else {
                 reasoning.push("not root: connection-table exhaustion only — run with sudo to add SYN/ACK".into());
-                ("router-lite", Tier::Aggressive)
+                "router-lite"
             }
         }
         TargetKind::Dns => {
             reasoning.push("port 53 open — random-subdomain query flood defeats caching".into());
-            ("dns", Tier::Moderate)
+            "dns"
         }
         TargetKind::Cdn => {
             reasoning.push(format!(
                 "WAF/CDN fingerprint ({}) — test whether the origin holds up behind the edge",
                 c.waf.as_deref().unwrap_or("unknown")
             ));
-            ("cdn", Tier::Moderate)
+            "cdn"
         }
         TargetKind::Api => {
             reasoning.push("HTTP/2 with a non-HTML root — looks like an API; multiplexed request + rapid-reset".into());
-            ("api", Tier::Moderate)
+            "api"
         }
         TargetKind::Web => {
             reasoning.push("serves HTML over HTTP(S) — L7 volumetric + slow-connection mix, recon-driven".into());
-            ("web", Tier::Moderate)
+            "web"
         }
         TargetKind::Unknown => {
-            reasoning.push("couldn't characterize the target — starting light and safe".into());
-            ("router-lite", Tier::Light)
+            reasoning.push("couldn't characterize the target — start with the connection-hold combo".into());
+            "router-lite"
         }
     };
-    Recommendation { preset, tier, reasoning }
+    Recommendation { preset, reasoning }
 }
 
 pub fn print_characterization(c: &Characterization) {
@@ -235,12 +233,11 @@ pub fn print_characterization(c: &Characterization) {
 pub fn print_recommendation(r: &Recommendation) {
     println!("\n===== recommendation =====");
     println!("preset : {}", r.preset);
-    println!("tier   : {} ({})", r.tier.slug(), r.tier.description());
     println!("why    :");
     for line in &r.reasoning {
         println!("  - {line}");
     }
-    println!("(edit anytime: re-run with --preset/--tier or --save-config to a file)");
+    println!("(edit anytime: re-run with --preset or --save-config to a file)");
     println!("==========================\n");
 }
 
