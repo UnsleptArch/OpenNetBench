@@ -80,6 +80,13 @@ do_uninstall() {
 }
 [ "$MODE" = "uninstall" ] && do_uninstall
 
+# 0. don't run the whole thing as root. sudo is used only for the copy step.
+#    building as root makes target/ root-owned, which then breaks later user
+#    builds and can leave the installer copying a stale binary.
+if [ "$(id -u)" -eq 0 ]; then
+  die "don't run this whole script as root. use './install.sh --system' (it sudo's only the copy). running 'sudo ./install.sh' builds as root and poisons target/."
+fi
+
 # 1. toolchain
 command -v cargo >/dev/null 2>&1 || die "no cargo on PATH. grab Rust from https://rustup.rs and run this again."
 info "using $(cargo --version)"
@@ -101,6 +108,20 @@ else
   install -m755 "$SRC" "$DEST_DIR/$BIN"
 fi
 ok "installed $DEST_DIR/$BIN"
+
+# verify the copy actually took and matches what we just built — otherwise a
+# stale/root-owned target or a silent copy failure looks like "success".
+if ! cmp -s "$SRC" "$DEST_DIR/$BIN"; then
+  die "install did not take: $DEST_DIR/$BIN does not match the built binary (permissions, or a stale root-owned target/?)"
+fi
+ok "verified it matches the fresh build"
+
+# a stale system copy will shadow a user install under sudo (sudo's secure_path
+# has /usr/local/bin but not ~/.local/bin), so flag it.
+if [ "$MODE" = "user" ] && [ -e "$SYS_BIN/$BIN" ] && ! cmp -s "$SRC" "$SYS_BIN/$BIN"; then
+  warn "$SYS_BIN/$BIN also exists and differs — 'sudo opennetbench' will run THAT older copy."
+  warn "run './install.sh --system' to refresh it, or 'sudo rm $SYS_BIN/$BIN'."
+fi
 
 # 4. make sure the per-user bin dir is actually on PATH, and keep it that way
 #    across new shells. system installs land in /usr/local/bin which is already
