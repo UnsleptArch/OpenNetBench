@@ -6,7 +6,7 @@ Rust. GPLv3. Linux.
 **Note much of this was written by AI, as always I have tested the code however there may still be some LLM driven problems in the code for professional traffic generation I would watch its log very carefully -unslept**
 
 
-Most load testers ask "how do you handle 10,000 happy shoppers." That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
+Most load testers ask "how do you handle 10,000 happy shoppers that are always on the home page!!!!!11!" That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
 
 It runs sixteen vectors from L3 to L7 off a single box. No spoofing, no amplification, no botnet, no C2. One real source IP that you can trace and kill instantly. That is a deliberate design choice, not a limitation, and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md).
 
