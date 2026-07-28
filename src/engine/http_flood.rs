@@ -14,6 +14,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const READ_HEADER_CAP: usize = 64 * 1024; // guard against never-ending headers
 const DRAIN_REUSE_MAX: usize = 64 * 1024; // bodies larger than this → close, don't drain
+// Per-request response deadline. A target we are exhausting slows to tens of
+// seconds per reply; without this cap each worker blocks on one dying request
+// and the flood throttles itself to the victim's rate. Abandon and recycle
+// instead, which also churns fresh connections (more pressure, not less).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // Base back-off after a transport failure (connect error or mid-request reset).
 // Keeps a refusing/resetting target from spinning a worker into a
 // millions-per-second reconnect loop that would produce junk RPS and exhaust
@@ -141,11 +146,14 @@ async fn one_request(
     metrics.bytes_sent.fetch_add(req.len() as u64, Relaxed);
 
     buf.clear();
+    // Absolute deadline for the whole response read (headers + bounded drain).
+    let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
     let (content_len, chunked, hdr_end, keep_alive) = loop {
-        // Race the read against shutdown: a target that accepts the request but
-        // never replies must not pin this worker past the stop signal.
+        // Race the read against shutdown AND the per-request deadline: a target
+        // that accepts the request but stalls must not pin this worker.
         let n = tokio::select! {
             r = conn.read_buf(buf) => r.map_err(|_| ())?,
+            _ = tokio::time::sleep_until(deadline) => return Err(()),
             _ = down.changed() => return Err(()),
         };
         if n == 0 {
@@ -208,7 +216,13 @@ async fn one_request(
             let mut remaining = cl.saturating_sub(already);
             while remaining > 0 {
                 buf.clear();
-                let n = conn.read_buf(buf).await.map_err(|_| ())?;
+                // Same deadline covers the body drain, so a slow trickle can't
+                // pin the worker either.
+                let n = tokio::select! {
+                    r = conn.read_buf(buf) => r.map_err(|_| ())?,
+                    _ = tokio::time::sleep_until(deadline) => return Err(()),
+                    _ = down.changed() => return Err(()),
+                };
                 if n == 0 {
                     return Err(());
                 }
