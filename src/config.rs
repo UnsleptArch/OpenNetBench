@@ -73,6 +73,11 @@ impl Vector {
         Vector::H2Continuation,
     ];
 
+    /// Resolve a vector from its slug (for `--vectors` flag parsing).
+    pub fn from_slug(s: &str) -> Option<Vector> {
+        Vector::ALL.into_iter().find(|v| v.slug() == s)
+    }
+
     pub fn slug(self) -> &'static str {
         match self {
             Vector::HttpFlood => "http_flood",

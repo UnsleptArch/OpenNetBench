@@ -67,9 +67,12 @@ pub fn present_recon(report: &ReconReport) {
 /// Resolve the exposure-scan wordlist: the flag's file if given, otherwise ask
 /// the operator (built-in default vs. a custom file). `None` means the built-in
 /// list, which recon fills in.
-pub fn choose_wordlist(flag: Option<&PathBuf>) -> Result<Option<Vec<String>>> {
+pub fn choose_wordlist(flag: Option<&PathBuf>, interactive: bool) -> Result<Option<Vec<String>>> {
     if let Some(p) = flag {
         return Ok(Some(load_wordlist(p)?));
+    }
+    if !interactive {
+        return Ok(None); // non-interactive: use the built-in default, no prompt
     }
     let choice = Select::new()
         .with_prompt("Wordlist for the path-exposure scan")

@@ -24,11 +24,31 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_BIN="${HOME}/.local/bin"
 SYS_BIN="/usr/local/bin"
 
-# tiny bit of colour so you can actually read the output
-info()  { printf '\033[1;36m[*]\033[0m %s\n' "$*"; }
-ok()    { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
-die()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+# colour palette. respect NO_COLOR and non-tty output (pipes, CI) by blanking it.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_CYAN=$'\033[1;36m'; C_MAGENTA=$'\033[1;35m'; C_GREEN=$'\033[1;32m'
+  C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'; C_BLUE=$'\033[1;34m'
+else
+  C_RESET=''; C_DIM=''; C_BOLD=''; C_CYAN=''; C_MAGENTA=''; C_GREEN=''
+  C_YELLOW=''; C_RED=''; C_BLUE=''
+fi
+
+info()  { printf '%s[*]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()    { printf '%s[+]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%s[!]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+die()   { printf '%s[x]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+rule() { printf '%s  ────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
+
+banner() {
+  printf '\n'
+  rule
+  printf '%s   ▚▚▚  %sOpenNetBench%s  %s▚▚▚%s\n' "$C_CYAN" "$C_BOLD$C_MAGENTA" "$C_RESET" "$C_CYAN" "$C_RESET"
+  printf '%s   single-origin adversarial load generator%s\n' "$C_DIM" "$C_RESET"
+  rule
+  printf '\n'
+}
 
 MODE="user"
 FEATURES=""
@@ -40,6 +60,8 @@ for arg in "$@"; do
     *)           die "unknown flag: $arg (try --system, --xdp, --uninstall)" ;;
   esac
 done
+
+banner
 
 target_dir() { [ "$MODE" = "system" ] && echo "$SYS_BIN" || echo "$USER_BIN"; }
 
@@ -105,14 +127,14 @@ fi
 # 5. done
 echo
 ok "ready."
-cat <<'EOF'
-
-quick start:
-  opennetbench                                   interactive walkthrough
-  opennetbench --list-presets                    what combos ship in the box
-  opennetbench --auto --target example.com       probe it, get a recommendation, run
-  sudo opennetbench --preset router --target 192.168.1.254 --duration 40
-
-raw vectors (syn/ack/icmp) need sudo. point it only at stuff you own or are
-cleared to hit. the consent gate will make you say so before anything fires.
-EOF
+echo
+printf '%squick start%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
+qs() { printf '  %s%-46s%s %s%s%s\n' "$C_GREEN" "$1" "$C_RESET" "$C_DIM" "$2" "$C_RESET"; }
+qs "opennetbench"                                "interactive walkthrough"
+qs "opennetbench --recon https://example.com"    "find + rank weak endpoints, no flood"
+qs "opennetbench --list-presets"                 "what combos ship in the box"
+qs "opennetbench --auto --target example.com"    "probe it, get a recommendation, run"
+qs "sudo opennetbench --preset router --target 192.168.1.254 --duration 40" ""
+echo
+printf '%sraw vectors (syn/ack/icmp) need sudo. point it only at stuff you own or are%s\n' "$C_YELLOW" "$C_RESET"
+printf '%scleared to hit. the consent gate will make you say so before anything fires.%s\n' "$C_YELLOW" "$C_RESET"

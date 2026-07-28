@@ -8,7 +8,7 @@ Rust. GPLv3. Linux.
 
 Most load testers ask "how do you handle 10,000 happy shoppers that are always on the home page!!!!!11!" That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
 
-It runs sixteen vectors from L3 to L7 off a single box. No spoofing, no amplification, no botnet, no C2. One real source IP that you can trace and kill instantly. That is a deliberate design choice, not a limitation, and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md). You many ask why, and the reason is because i was too lazy to implement all of those and it would look unprofessional on my CV or whatnot.
+It runs sixteen vectors from L3 to L7 off a single box. No amplification, no botnet, no C2. There is an optional SOCKS5 proxy for the L7 traffic if you want it, and the raw L4 stuff still goes out this host's own address, so it is not an anonymity tool and never pretends to be one. That lean design is deliberate and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md). You many ask why, and the reason is because i was too lazy to implement all of that and it would look unprofessional on my CV or whatnot.
 
 This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench hands you a verdict.
 
@@ -19,6 +19,16 @@ This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench 
 wrk, JMeter, Locust and friends model legitimate users. They tell you your throughput ceiling under polite traffic. None of them will hold ten thousand half-open connections until your worker pool starves, or open a stream and reset it before the server can breathe, or fill a home router's conntrack table in under a second. Those are the patterns that actually cause outages and those are the patterns this tool speaks.
 
 The other half of the tool is the part nobody else bothers with. Generating load is easy. Knowing whether the target actually degraded, versus your own box running out of sockets, versus a WAF quietly eating the traffic, that is the hard part. OpenNetBench runs two independent observers against the target the whole time and classifies the outcome with a confidence and an evidence trail. It will not call a working rate limiter a "vuln" and it will not blame the target for your local port exhaustion.
+
+---
+
+## Finding the weak point
+
+Firepower is half of it. The other half is knowing where to aim. Before it floods anything, OpenNetBench runs an active recon pass that hunts for asymmetry, the one endpoint where a cheap request costs the server a fortune.
+
+It crawls the target, reads its `robots.txt`, sitemap and OpenAPI/Swagger spec for free, and mines the JavaScript bundles for API routes, so on a single-page app it finds the real surface instead of a pile of static assets. Then it actively probes each candidate. It sends a cheap value and an expensive one for every parameter, a huge limit, a leading-wildcard search that defeats the index, a catastrophic-backtracking pattern, and measures the extra server time the expensive one forces. It samples in interleaved pairs and attaches a confidence, so a noisy 300ms spike does not outrank a rock solid 80ms one. It pushes the top two parameters together to catch interaction effects. It fires one small bounded burst to find where latency knees under load, normalized against a control so it is measuring the server and not your own client. It probes GraphQL query cost with a read-only fan-out. It notices when a server hands back a catch-all page for every path so it does not report your whole wordlist as "exposed."
+
+Out comes a ranked list of endpoints by measured asymmetry, each tagged with the parameter that hurt and by how much, for you to approve before anything gets flooded. Point it at a target and just look, no flood, with `--recon`. Bring your own path wordlist with `--wordlist`.
 
 ---
 
@@ -79,7 +89,19 @@ sudo opennetbench --preset router --target 192.168.1.254 --duration 40
 # build an editable plan without firing it, run it later
 opennetbench --preset api --target https://api.example.com --save-config api.json
 opennetbench --config api.json
+
+# recon only, find and rank the weak endpoints, send no flood
+opennetbench --recon https://example.com
+
+# fully scripted, no prompts at all (--i-am-authorized asserts you are cleared to test it)
+opennetbench --target https://example.com --vectors http_flood,slowloris \
+  --duration 60 --i-am-authorized
+
+# route the L7 traffic through a proxy (raw L4/UDP still leaves this host)
+opennetbench --preset web --target https://example.com --proxy socks5://127.0.0.1:9050
 ```
+
+Every interactive choice has a flag, so the whole thing scripts cleanly. `--list-vectors` prints the slugs, `--i-am-authorized` skips the typed consent phrase for unattended runs.
 
 Targets are a URL or a bare IP. Bare IPs default to `http://` because router and admin UIs are usually plaintext and the L4 vectors just want `address:port`. Hostnames default to `https://`.
 
@@ -126,7 +148,7 @@ Confidence is capped at 0.9. It reports likelihood, never proof. It also knows t
 
 ## Safety model
 
-Everything leaves one host. There is no agent protocol, no peer discovery, no remote control anywhere in the tree, and the raw vectors compute their checksums from the machine's real source IP so spoofing is not even wired up. Every run starts with a consent gate you have to type an exact phrase into at a real terminal, it cannot be satisfied by a flag or a pipe. Stop the process, stop the traffic. The full threat model is in [docs/SAFETY.md](docs/SAFETY.md).
+Everything leaves one host, or a proxy if you point one at it. The optional SOCKS5 proxy routes the L7 and TCP vectors; the raw L4 and UDP vectors always send from this machine's real address, so a proxy is not a cloak and the tool does not pretend otherwise. There is no agent protocol, no peer discovery, no remote control anywhere in the tree. Every interactive run starts with a consent gate you type an exact phrase into at a real terminal; unattended runs assert authorization explicitly with `--i-am-authorized`, which is a choice you are making on the command line, not a silent default. Stop the process, stop the traffic. The full threat model is in [docs/SAFETY.md](docs/SAFETY.md).
 
 ---
 
@@ -144,7 +166,7 @@ Good-faith authorized testing only. Your own systems, your lab, a CTF, or a clie
 - [docs/VECTORS.md](docs/VECTORS.md) — the sixteen vectors in detail
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine is built, module by module
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — the fast path, the numbers, the benchmarking method
-- [docs/SAFETY.md](docs/SAFETY.md) — single origin, no spoofing, no C2, why it is built this way
+- [docs/SAFETY.md](docs/SAFETY.md) — the threat model, what it deliberately is not, and why
 
 ## License
 

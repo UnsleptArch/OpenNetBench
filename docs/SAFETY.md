@@ -14,7 +14,7 @@ It is not a botnet, not a C2 framework, not a stresser service, and not a fancy 
 
 None of these is a promise you have to trust. Each one falls out of the structure of the tree.
 
-**Single origin.** Every packet leaves this one host. There is no agent protocol, no peer discovery, no coordination or control channel anywhere in the source. You cannot point it at a fleet because there is no fleet-pointing code to invoke. Grep the tree, there is nothing to find.
+**Single origin.** Every packet leaves this one host, or the SOCKS5 proxy you point it at for the L7 and TCP vectors. There is no agent protocol, no peer discovery, no coordination or control channel anywhere in the source. You cannot point it at a fleet because there is no fleet-pointing code to invoke. Grep the tree, there is nothing to find.
 
 **No spoofing.** The raw vectors compute their IP and TCP checksums from the machine's real source address (`local_src_ipv4`) and the full-frame path uses the real source MAC. There is no source-address parameter to set. It is not that spoofing is discouraged, it is that it is not wired up, and it would break the stateful TCP vectors anyway since the SYN-ACK would come back to whatever address you faked.
 
@@ -22,11 +22,11 @@ None of these is a promise you have to trust. Each one falls out of the structur
 
 **No command and control.** The only network egress is the attack traffic and the two probes, and all of it goes to the target you named. There is no remote-control surface, nothing listens, nothing phones home. Kill the process and the traffic stops instantly and completely, there is no second stage sitting on another machine.
 
-**Mandatory consent.** Every run stops at a gate in `auth.rs` that makes you type an exact phrase at a real terminal. It checks for a TTY and compares the phrase exactly, so it cannot be satisfied by a command-line flag, an environment variable, or a piped `yes`. A saved config file does not buy you out of it either. It is a speed bump you have to consciously step over, on every single run.
+**Consent on every run.** Every interactive run stops at a gate in `auth.rs` that makes you type an exact phrase at a real terminal. It checks for a TTY and compares the phrase exactly, so a piped `yes` or an environment variable will not satisfy it, and a saved config does not buy you out of it. Unattended and scripted runs assert authorization instead with the explicit `--i-am-authorized` flag. That is a deliberate thing you put on the command line, not a silent default, so either way you are stepping over the line on purpose rather than tripping over it by accident.
 
 ## Why single origin is a feature
 
-A single real source IP means every run is fully attributable and instantly containable. Your logs show one address. The target's logs show one address. There is no cleanup, no scattered infrastructure, no plausible deniability, and no way for this to quietly become something else. Stop the process, stop the traffic, done. That containment is worth more for a legitimate testing tool than raw firepower is, and the tool already pushes past 10GbE from one box anyway (see [PERFORMANCE.md](PERFORMANCE.md)), so single origin is not even costing you the numbers.
+With no proxy in play, every run is instantly containable and comes from one address: your logs show it, the target's logs show it. Point a proxy at it and the L7 and TCP traffic routes through that instead, but the raw L4 and UDP vectors still leave from your real address, so this is not an anonymity tool and you should not treat it as one. Either way there is no scattered infrastructure and no second stage sitting on another machine. Stop the process, stop the traffic, done. That containment is worth more for a legitimate testing tool than raw firepower is, and the tool already pushes past 10GbE from one box anyway (see [PERFORMANCE.md](PERFORMANCE.md)).
 
 ## Your responsibility
 

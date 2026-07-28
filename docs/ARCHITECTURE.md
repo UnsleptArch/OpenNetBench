@@ -4,7 +4,7 @@ How the thing is actually built, module by module, with the reasoning. If you wa
 
 ## One paragraph
 
-OpenNetBench is a single-origin adversarial-load tool. It generates the traffic real attackers use, L3 up to L7, sixteen vectors, from one host, measures how the target behaves under that load with two independent probes, and classifies the outcome with a confidence and an evidence trail. No spoofing, no amplification, no command and control, all by construction. The NIC is the hard ceiling and every byte is attributable.
+OpenNetBench is a single-origin adversarial-load tool. It generates the traffic real attackers use, L3 up to L7, sixteen vectors, from one host, measures how the target behaves under that load with two independent probes, and classifies the outcome with a confidence and an evidence trail. No amplification and no command and control, all by construction, with an optional SOCKS5 proxy for the L7 path. The NIC is the hard ceiling.
 
 ## Safety model, enforced by the code
 

@@ -1,8 +1,10 @@
 //! OpenNetBench — single-origin adversarial-load / resilience assessment tool.
 //!
 //! Safety model (enforced by architecture, not just policy): all traffic
-//! originates from this host, there is no IP spoofing, no amplification, and no
-//! command-and-control. A mandatory consent gate blocks every run.
+//! originates from this host (an optional SOCKS5 proxy routes L7/TCP traffic;
+//! raw L4/UDP vectors always leave from this host), there is no amplification
+//! and no command-and-control. A consent gate — typed, or asserted explicitly
+//! with --i-am-authorized for unattended runs — precedes every run.
 
 // Scaffold stage: several types/functions are forward-declared for modules that
 // land in later increments (engine workers, web server, DB, CVE correlation).
@@ -97,6 +99,34 @@ struct Args {
     /// If omitted, recon prompts and offers a built-in default.
     #[arg(long, value_name = "FILE")]
     wordlist: Option<PathBuf>,
+
+    /// Proxy URL for L7/TCP traffic (e.g. socks5://127.0.0.1:9050). Raw L4/UDP
+    /// vectors always send from this host — a proxy does not anonymize them.
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+
+    /// Run mode for a flag-driven run: adaptive (self-throttling, default) or dumb.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
+
+    /// Comma-separated vector slugs for a fully flag-driven run (see
+    /// --list-vectors). Requires --target; builds the plan without any prompts.
+    #[arg(long, value_name = "SLUGS")]
+    vectors: Option<String>,
+
+    /// Enable recon in a flag-driven (--vectors) run.
+    #[arg(long)]
+    run_recon: bool,
+
+    /// List the available vector slugs, then exit.
+    #[arg(long)]
+    list_vectors: bool,
+
+    /// Assert authorization non-interactively: skip the typed consent phrase and
+    /// the final confirmation so the tool can run unattended/scripted. By passing
+    /// it you affirm you are authorized to test the target.
+    #[arg(long)]
+    i_am_authorized: bool,
 }
 
 #[tokio::main]
@@ -110,6 +140,11 @@ async fn main() -> Result<()> {
 
     if args.list_presets {
         print_presets();
+        return Ok(());
+    }
+
+    if args.list_vectors {
+        print_vectors();
         return Ok(());
     }
 
@@ -138,16 +173,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Legal notice + mandatory consent gate — always, before anything else.
+    // Legal notice + consent gate. --i-am-authorized asserts authorization
+    // non-interactively (for unattended/scripted runs); otherwise a human types
+    // the phrase. Either way the legal notice is shown.
     println!("{}\n", auth::LEGAL_NOTICE);
-    auth::require_consent()?;
+    if args.i_am_authorized {
+        info!("authorization asserted via --i-am-authorized (non-interactive run)");
+    } else {
+        auth::require_consent()?;
+    }
 
     // --recon: recon-only. Run the recon suite against the URL, print the ranked
     // report, and exit. No flood is scheduled — only recon's bounded probes.
     if let Some(target) = &args.recon {
-        let wordlist = cli::choose_wordlist(args.wordlist.as_ref())?;
+        let wordlist = cli::choose_wordlist(args.wordlist.as_ref(), !args.i_am_authorized)?;
         println!("Recon-only against {target} — no flood will be sent.\n");
-        match recon::run_recon(target, None, wordlist.as_deref()).await {
+        match recon::run_recon(target, flag_proxy(&args).as_ref(), wordlist.as_deref()).await {
             Ok(report) => cli::present_recon(&report),
             Err(e) => return Err(anyhow!("recon failed: {e}")),
         }
@@ -174,7 +215,7 @@ async fn main() -> Result<()> {
         let cfg = presets::build_config(
             preset,
             target,
-            None,
+            flag_proxy(&args),
             std::time::Duration::from_secs(args.duration),
             std::time::Duration::from_secs(args.rampup),
         );
@@ -187,6 +228,18 @@ async fn main() -> Result<()> {
                 cfg
             }
             (None, Some(path)) => cli::load_config(path)?,
+            // Fully flag-driven run: --vectors builds a plan with no prompts.
+            (None, None) if args.vectors.is_some() => {
+                let cfg = build_flag_config(&args)?;
+                cli::print_summary(&cfg);
+                cfg
+            }
+            // Non-interactive with no plan source is an error, not a hang.
+            (None, None) if args.i_am_authorized => {
+                return Err(anyhow!(
+                    "--i-am-authorized needs a plan: use --preset, --config, --auto, or --vectors"
+                ));
+            }
             (None, None) => {
                 let plan = cli::interactive_flow()?;
                 auto_approve = plan.auto_approve;
@@ -204,7 +257,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     if cfg.run_recon {
-        let wordlist = cli::choose_wordlist(args.wordlist.as_ref())?;
+        let wordlist = cli::choose_wordlist(args.wordlist.as_ref(), !args.i_am_authorized)?;
         info!(target = %cfg.target, "recon: starting");
         match recon::run_recon(&cfg.target, cfg.proxy.as_ref(), wordlist.as_deref()).await {
             Ok(report) => {
@@ -231,11 +284,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Final go/no-go before generating any traffic.
-    if !dialoguer::Confirm::new()
-        .with_prompt("Execute this plan now?")
-        .default(false)
-        .interact()?
+    // Final go/no-go before generating any traffic. --i-am-authorized skips it
+    // (the assertion already covered authorization for this unattended run).
+    if !args.i_am_authorized
+        && !dialoguer::Confirm::new()
+            .with_prompt("Execute this plan now?")
+            .default(false)
+            .interact()?
     {
         info!("operator declined execution at final gate — exiting");
         println!("Aborted. No traffic sent.");
@@ -268,10 +323,81 @@ fn build_preset_config(args: &Args, name: &str) -> Result<config::RunConfig> {
     Ok(presets::build_config(
         preset,
         target,
-        None,
+        flag_proxy(args),
         std::time::Duration::from_secs(args.duration),
         std::time::Duration::from_secs(args.rampup),
     ))
+}
+
+/// Build the ProxyConfig from --proxy, if given.
+fn flag_proxy(args: &Args) -> Option<config::ProxyConfig> {
+    args.proxy
+        .as_ref()
+        .map(|url| config::ProxyConfig { url: url.clone() })
+}
+
+/// Build a fully flag-driven run config from --vectors and friends (no prompts).
+fn build_flag_config(args: &Args) -> Result<config::RunConfig> {
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("--vectors requires --target"))?;
+    let target = cli::normalize_target(target)?;
+
+    let mut vectors = Vec::new();
+    for slug in args
+        .vectors
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let v = config::Vector::from_slug(slug)
+            .ok_or_else(|| anyhow!("unknown vector '{slug}' — see --list-vectors"))?;
+        vectors.push(config::VectorPlan {
+            vector: v,
+            tuning: config::VectorTuning::defaults_for(v),
+        });
+    }
+    anyhow::ensure!(!vectors.is_empty(), "--vectors needs at least one vector slug");
+
+    let mode = match args.mode.as_deref() {
+        None | Some("adaptive") => config::RunMode::Adaptive,
+        Some("dumb") => config::RunMode::Dumb,
+        Some(other) => return Err(anyhow!("unknown mode '{other}' — use adaptive or dumb")),
+    };
+
+    if vectors.iter().any(|p| p.vector.needs_root()) && !is_root() {
+        eprintln!("note: selected vectors include raw-socket vectors — run with sudo.");
+    }
+
+    Ok(config::RunConfig {
+        target,
+        proxy: flag_proxy(args),
+        mode,
+        run_recon: args.run_recon,
+        vectors,
+        duration: std::time::Duration::from_secs(args.duration),
+        rampup: std::time::Duration::from_secs(args.rampup),
+    })
+}
+
+/// Print the available vector slugs (for --vectors), then return.
+fn print_vectors() {
+    println!("Vectors (use --vectors slug,slug,... with --target):\n");
+    for v in config::Vector::ALL {
+        let root = if v.needs_root() { "  [root]" } else { "" };
+        println!(
+            "  {:<16} [{}] {}{}",
+            v.slug(),
+            v.layer(),
+            v.description(),
+            root
+        );
+    }
+    println!("\nExample:\n  ./opennetbench --target https://example.com \\");
+    println!("    --vectors http_flood,slowloris --duration 60 --i-am-authorized");
 }
 
 fn is_root() -> bool {
