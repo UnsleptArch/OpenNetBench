@@ -8,7 +8,7 @@ Rust. GPLv3. Linux.
 
 Most load testers ask "how do you handle 10,000 happy shoppers that are always on the home page!!!!!11!" That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
 
-It runs nineteen vectors from L3 to L7 off a single box. No amplification, no botnet, no C2. There is an optional SOCKS5 proxy for the L7 traffic if you want it, and the raw L4 stuff still goes out this host's own address, so it is not an anonymity tool and never pretends to be one. That lean design is deliberate and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md). You many ask why, and the reason is because i was too lazy to implement all of that and it would look unprofessional on my CV or whatnot.
+It runs twenty vectors from L3 to L7 off a single box. No amplification, no botnet, no C2. There is an optional SOCKS5 proxy for the L7 traffic if you want it, and the raw L4 stuff still goes out this host's own address, so it is not an anonymity tool and never pretends to be one. That lean design is deliberate and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md). You many ask why, and the reason is because i was too lazy to implement all of that and it would look unprofessional on my CV or whatnot.
 
 This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench hands you a verdict.
 
@@ -131,6 +131,7 @@ Full flag and preset reference lives in [docs/USAGE.md](docs/USAGE.md).
 | `cache_bust` | L7 | HTTP flood with a unique query per request, skips the CDN and hits the origin |
 | `header_flood` | L7 | huge, numerous request headers, cheap to send and costly to parse |
 | `websocket` | L7 | real WebSocket handshakes held open, saturates the server's session capacity |
+| `quic_flood` | L4/5 | churns QUIC/HTTP-3 handshakes over UDP, asymmetric TLS 1.3 crypto on the server |
 
 Deeper notes on each one, and why it hurts, are in [docs/VECTORS.md](docs/VECTORS.md).
 
@@ -166,7 +167,7 @@ Good-faith authorized testing only. Your own systems, your lab, a CTF, or a clie
 ## Docs
 
 - [docs/USAGE.md](docs/USAGE.md) — every flag, preset, and config knob
-- [docs/VECTORS.md](docs/VECTORS.md) — the nineteen vectors in detail
+- [docs/VECTORS.md](docs/VECTORS.md) — the twenty vectors in detail
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine is built, module by module
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — the fast path, the numbers, the benchmarking method
 - [docs/SAFETY.md](docs/SAFETY.md) — the threat model, what it deliberately is not, and why

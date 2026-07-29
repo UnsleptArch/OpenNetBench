@@ -1,6 +1,6 @@
 # Vectors
 
-Nineteen of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
+Twenty of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
 
 Every vector shares the same skeleton. It gates on its own governor so ramp-up and adaptive throttle work per vector, it races a shutdown watch so stopping the process stops the traffic within the drain grace, and it records into its own lock-free metrics so one distressed vector never throttles a healthy one.
 
@@ -41,6 +41,8 @@ The named-CVE HTTP/2 attacks. These are cheap for the client and brutal for the 
 ## State and handshake exhaustion, L4/5
 
 **tls_exhaust.** Repeated full TLS handshakes. A handshake is cheap for you to start and expensive for the server to complete, all that asymmetric crypto is on their side. Latency here is literally the server's handshake cost.
+
+**quic_flood.** The same handshake-exhaustion idea, moved onto QUIC. It churns full QUIC connections over UDP: open, complete the TLS 1.3 handshake, drop, repeat, so the server keeps paying the asymmetric crypto and per-attempt connection state that fronts every HTTP/3 stack. Built on quinn because QUIC's Initial-packet crypto and header protection are not something you hand-roll correctly. ALPN is `h3` so it targets HTTP/3 endpoints, and it does not validate the server cert because it is generating load, not authenticating. One caveat worth knowing: it only bites if the target actually speaks QUIC on the UDP port, and a lot of origins only expose HTTP/3 at the CDN edge, so aim it where h3 is really terminated.
 
 **tcp_exhaust.** Holds bare TCP connections open, no application traffic, just occupancy. Fills the accept backlog and the connection table. This is the no-root way to exhaust state, and it is what kills home routers even without raw sockets.
 
