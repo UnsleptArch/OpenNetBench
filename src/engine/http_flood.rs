@@ -45,6 +45,7 @@ struct Live<'a> {
     _held: HeldGuard<'a>,
 }
 
+#[allow(clippy::too_many_arguments)] // shared worker for several GET-based vectors
 pub async fn worker(
     idx: u32,
     target: Arc<Target>,
@@ -53,9 +54,16 @@ pub async fn worker(
     gov: Arc<Governor>,
     shutdown: Arc<Shutdown>,
     rate_per_worker: u32,
+    // When true, a unique query param is spliced into every request so CDN/proxy
+    // caches miss and the load reaches the origin (the cache_bust vector).
+    cache_bust: bool,
 ) {
     let mut down = shutdown.subscribe();
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // Scratch + monotonic id for cache-buster assembly (unused when off). The id
+    // packs the worker index into the high bits so it's unique across workers.
+    let mut cb_scratch: Vec<u8> = Vec::new();
+    let mut cb_counter: u64 = 0;
     let mut tmpl_i: usize = idx as usize % templates.len();
     let interval = (rate_per_worker > 0).then(|| Duration::from_secs_f64(1.0 / rate_per_worker as f64));
     let mut next_tick = tokio::time::Instant::now();
@@ -111,7 +119,14 @@ pub async fn worker(
         }
 
         let l = live.as_mut().unwrap();
-        let req = &templates[tmpl_i];
+        let req: &[u8] = if cache_bust {
+            let id = ((idx as u64) << 40) | (cb_counter & 0xFF_FFFF_FFFF);
+            cb_counter += 1;
+            cache_bust_into(&templates[tmpl_i], id, &mut cb_scratch);
+            &cb_scratch
+        } else {
+            &templates[tmpl_i]
+        };
         tmpl_i = (tmpl_i + 1) % templates.len();
 
         match one_request(&mut l.conn, req, &mut buf, &metrics, &mut down).await {
@@ -238,10 +253,78 @@ async fn one_request(
     }
 }
 
+/// Splice a unique cache-busting query param into a GET template's request line,
+/// writing the result into `out`. A distinct URL per request defeats CDN/proxy
+/// cache keys so the request reaches the origin. Inserts `?_cb=<id>` (or
+/// `&_cb=<id>` if the path already has a query) just before the ` HTTP/1.1` that
+/// ends the request line; the rest of the template is copied verbatim.
+fn cache_bust_into(template: &[u8], id: u64, out: &mut Vec<u8>) {
+    out.clear();
+    // The request line is everything before the first CRLF; " HTTP/" marks its end.
+    let line_end = template
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(template.len());
+    let insert_at = template[..line_end]
+        .windows(6)
+        .position(|w| w == b" HTTP/")
+        .unwrap_or(line_end);
+    let has_query = template[..insert_at].contains(&b'?');
+
+    out.extend_from_slice(&template[..insert_at]);
+    out.push(if has_query { b'&' } else { b'?' });
+    out.extend_from_slice(b"_cb=");
+    // Append id as ASCII digits without allocating.
+    let mut n = id;
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
+    out.extend_from_slice(&template[insert_at..]);
+}
+
 /// Sleep, but wake immediately on shutdown.
 async fn sleep_or_stop(down: &mut tokio::sync::watch::Receiver<bool>, dur: Duration) {
     tokio::select! {
         _ = tokio::time::sleep(dur) => {}
         _ = down.changed() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bust(template: &str, id: u64) -> String {
+        let mut out = Vec::new();
+        cache_bust_into(template.as_bytes(), id, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn cache_buster_appends_query_when_path_has_none() {
+        let got = bust("GET /path HTTP/1.1\r\nHost: x\r\n\r\n", 5);
+        assert_eq!(got, "GET /path?_cb=5 HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    #[test]
+    fn cache_buster_extends_an_existing_query() {
+        let got = bust("GET /p?a=1 HTTP/1.1\r\nHost: x\r\n\r\n", 42);
+        assert_eq!(got, "GET /p?a=1&_cb=42 HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    #[test]
+    fn cache_buster_is_unique_per_id_and_leaves_headers_intact() {
+        let a = bust("GET / HTTP/1.1\r\nHost: x\r\n\r\n", 1);
+        let b = bust("GET / HTTP/1.1\r\nHost: x\r\n\r\n", 2);
+        assert_ne!(a, b, "different ids must yield different URLs");
+        assert!(a.ends_with("HTTP/1.1\r\nHost: x\r\n\r\n"), "only the request line changes");
     }
 }

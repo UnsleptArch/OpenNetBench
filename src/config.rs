@@ -51,10 +51,16 @@ pub enum Vector {
     /// L7 — CVE-2024-27316 HTTP/2 CONTINUATION flood: endless CONTINUATION
     /// frames without END_HEADERS force unbounded header-buffer growth.
     H2Continuation,
+    /// L7 — cache-busting HTTP flood: a unique query param per request defeats
+    /// CDN/reverse-proxy caching so every request reaches the origin.
+    CacheBust,
+    /// L7 — header-amplification flood: pathologically large/numerous request
+    /// headers force costly per-request parsing (parser-CPU, not bandwidth).
+    HeaderFlood,
 }
 
 impl Vector {
-    pub const ALL: [Vector; 16] = [
+    pub const ALL: [Vector; 18] = [
         Vector::HttpFlood,
         Vector::HttpsOnly,
         Vector::H2RapidReset,
@@ -71,6 +77,8 @@ impl Vector {
         Vector::AckFlood,
         Vector::IcmpFlood,
         Vector::H2Continuation,
+        Vector::CacheBust,
+        Vector::HeaderFlood,
     ];
 
     /// Resolve a vector from its slug (for `--vectors` flag parsing).
@@ -96,6 +104,8 @@ impl Vector {
             Vector::AckFlood => "ack_flood",
             Vector::IcmpFlood => "icmp_flood",
             Vector::H2Continuation => "h2_continuation",
+            Vector::CacheBust => "cache_bust",
+            Vector::HeaderFlood => "header_flood",
         }
     }
 
@@ -154,6 +164,8 @@ impl Vector {
             Vector::AckFlood => "TCP ACK flood via raw socket — stresses firewall/conntrack",
             Vector::IcmpFlood => "ICMP echo flood via raw socket (requires root)",
             Vector::H2Continuation => "CVE-2024-27316 HTTP/2 CONTINUATION flood — unbounded header buffer",
+            Vector::CacheBust => "Cache-busting HTTP flood — unique query per request, hits the origin not the CDN",
+            Vector::HeaderFlood => "Header-amplification flood — huge/numerous headers, costly to parse",
         }
     }
 }

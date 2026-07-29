@@ -339,6 +339,7 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
                         gov.clone(),
                         shutdown.clone(),
                         plan.tuning.rate_per_worker,
+                        false,
                     )));
                 }
             }
@@ -470,6 +471,7 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
                         gov.clone(),
                         shutdown.clone(),
                         plan.tuning.rate_per_worker,
+                        false,
                     )));
                 }
             }
@@ -532,6 +534,40 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
                         metrics.clone(),
                         gov.clone(),
                         shutdown.clone(),
+                    )));
+                }
+            }
+            // Cache-busting flood reuses the http_flood worker with a unique query
+            // param spliced into each request (cache_bust = true).
+            Vector::CacheBust => {
+                let templates = net::build_get_templates(&target.host, &target.path);
+                for idx in 0..concurrency {
+                    handles.push(tokio::spawn(http_flood::worker(
+                        idx,
+                        target.clone(),
+                        templates.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.rate_per_worker,
+                        true,
+                    )));
+                }
+            }
+            // Header-amplification flood reuses the http_flood worker with a
+            // header-bloated template.
+            Vector::HeaderFlood => {
+                let templates = net::build_header_flood_templates(&target.host, &target.path);
+                for idx in 0..concurrency {
+                    handles.push(tokio::spawn(http_flood::worker(
+                        idx,
+                        target.clone(),
+                        templates.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.rate_per_worker,
+                        false,
                     )));
                 }
             }
