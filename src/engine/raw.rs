@@ -147,7 +147,16 @@ fn fast_send_loop(
                 // Enqueued to the wire — NOT a target response. See Metrics::packets_sent.
                 metrics.packets_sent.fetch_add(1, Relaxed);
             }
-            Ok(false) => {} // ring/buffer-full backpressure drop — attempted, not sent
+            Ok(false) => {
+                // Ring/buffer-full backpressure drop — attempted, not sent. The wire
+                // can't take more right now (e.g. wlan0's airtime cap keeps the TX
+                // ring full), so don't hot-spin this pinned core: yield it so the L7
+                // vectors, health probes, and other shards get to run. When several
+                // raw vectors run at once they'd otherwise pin and peg every core and
+                // starve everything else. Costs nothing on a flowing NIC, where sends
+                // return Ok(true) and never reach here.
+                std::thread::yield_now();
+            }
             Err(_) => {
                 metrics.errors.fetch_add(1, Relaxed);
             }
