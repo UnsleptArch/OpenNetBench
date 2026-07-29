@@ -1,6 +1,6 @@
 # Vectors
 
-Eighteen of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
+Nineteen of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
 
 Every vector shares the same skeleton. It gates on its own governor so ramp-up and adaptive throttle work per vector, it races a shutdown watch so stopping the process stops the traffic within the drain grace, and it records into its own lock-free metrics so one distressed vector never throttles a healthy one.
 
@@ -27,6 +27,8 @@ These do not need volume. They need patience. A handful of connections held wron
 **rudy.** R-U-Dead-Yet. Sends a complete, legitimate POST header advertising a content length, then trickles the body one tiny piece at a time forever. The server holds a worker waiting for a body that never fully arrives.
 
 **slow_read.** The mirror image of slowloris. Sends a normal request but advertises a tiny receive window and drains the response a byte per tick, so the server's send buffer stays pinned and it cannot free the connection.
+
+**websocket.** Completes a real RFC 6455 upgrade handshake, then holds the session open and trickles small masked keepalive frames. A live WebSocket is heavier than a bare TCP connection: the server keeps a session object, per-connection read and write buffers, and usually a dedicated task or goroutine per socket, and those pools are often smaller and less defended than the HTTP one. A few hundred held sessions saturate WS capacity the way slowloris starves an HTTP worker pool. Hand-rolled, no library: it sends the Upgrade GET, checks for a 101, and does not bother validating the accept because it is generating load, not acting as a client. Point it at the WebSocket path (`ws` over `http://`, `wss` over `https://`).
 
 ## Protocol abuse, L7
 
