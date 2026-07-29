@@ -25,6 +25,7 @@ mod syn_flood;
 mod tcp_exhaust;
 mod tls_exhaust;
 mod udp_flood;
+mod websocket;
 mod wire;
 #[cfg(feature = "xdp")]
 mod xdp;
@@ -568,6 +569,20 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
                         shutdown.clone(),
                         plan.tuning.rate_per_worker,
                         false,
+                    )));
+                }
+            }
+            Vector::WebSocket => {
+                let handshake = net::build_ws_handshake(&target.host, &target.path);
+                for idx in 0..concurrency {
+                    handles.push(tokio::spawn(websocket::worker(
+                        idx,
+                        target.clone(),
+                        handshake.clone(),
+                        metrics.clone(),
+                        gov.clone(),
+                        shutdown.clone(),
+                        plan.tuning.trickle_interval,
                     )));
                 }
             }

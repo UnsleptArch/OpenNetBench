@@ -383,6 +383,24 @@ pub fn build_header_flood_templates(host: &str, path: &str) -> Arc<[Box<[u8]>]> 
     templates.into()
 }
 
+/// Pre-build the WebSocket (RFC 6455) upgrade handshake: a GET carrying the
+/// Upgrade headers. Uses a fixed `Sec-WebSocket-Key`; the worker only checks the
+/// response for "101 Switching Protocols" and does not validate the server's
+/// accept, because it is generating load, not acting as a conformant client.
+pub fn build_ws_handshake(host: &str, path: &str) -> Arc<[u8]> {
+    let (ua, _) = FINGERPRINTS[0];
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: {ua}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    req.into_bytes().into()
+}
+
 /// Pre-build the partial (deliberately unterminated) request head slowloris
 /// workers send once per connection. Note the absence of the final blank line.
 pub fn build_slowloris_head(host: &str, path: &str) -> Arc<[u8]> {

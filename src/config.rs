@@ -57,10 +57,13 @@ pub enum Vector {
     /// L7 — header-amplification flood: pathologically large/numerous request
     /// headers force costly per-request parsing (parser-CPU, not bandwidth).
     HeaderFlood,
+    /// L7 — WebSocket exhaustion: completes real upgrade handshakes and holds the
+    /// sessions open with keepalive frames, saturating the server's WS capacity.
+    WebSocket,
 }
 
 impl Vector {
-    pub const ALL: [Vector; 18] = [
+    pub const ALL: [Vector; 19] = [
         Vector::HttpFlood,
         Vector::HttpsOnly,
         Vector::H2RapidReset,
@@ -79,6 +82,7 @@ impl Vector {
         Vector::H2Continuation,
         Vector::CacheBust,
         Vector::HeaderFlood,
+        Vector::WebSocket,
     ];
 
     /// Resolve a vector from its slug (for `--vectors` flag parsing).
@@ -106,6 +110,7 @@ impl Vector {
             Vector::H2Continuation => "h2_continuation",
             Vector::CacheBust => "cache_bust",
             Vector::HeaderFlood => "header_flood",
+            Vector::WebSocket => "websocket",
         }
     }
 
@@ -166,6 +171,7 @@ impl Vector {
             Vector::H2Continuation => "CVE-2024-27316 HTTP/2 CONTINUATION flood — unbounded header buffer",
             Vector::CacheBust => "Cache-busting HTTP flood — unique query per request, hits the origin not the CDN",
             Vector::HeaderFlood => "Header-amplification flood — huge/numerous headers, costly to parse",
+            Vector::WebSocket => "WebSocket exhaustion — hold upgraded sessions open, saturate WS capacity",
         }
     }
 }
@@ -215,7 +221,7 @@ impl VectorTuning {
     /// Sensible small-scale defaults for a given vector.
     pub fn defaults_for(v: Vector) -> Self {
         match v {
-            Vector::Slowloris | Vector::SlowRead => VectorTuning {
+            Vector::Slowloris | Vector::SlowRead | Vector::WebSocket => VectorTuning {
                 concurrency: 200,
                 rate_per_worker: 0,
                 payload_bytes: 0,
