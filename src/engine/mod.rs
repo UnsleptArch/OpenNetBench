@@ -17,6 +17,7 @@ mod l2;
 mod net;
 mod packet_mmsg;
 mod packet_tx;
+mod quic;
 mod raw;
 mod rudy;
 mod slow_read;
@@ -586,6 +587,23 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
                     )));
                 }
             }
+            Vector::QuicFlood => match quic::endpoint(target.addr) {
+                Ok(ep) => {
+                    let name: Arc<str> = Arc::from(target.host.as_str());
+                    for idx in 0..concurrency {
+                        handles.push(tokio::spawn(quic::worker(
+                            idx,
+                            ep.clone(),
+                            target.addr,
+                            name.clone(),
+                            metrics.clone(),
+                            gov.clone(),
+                            shutdown.clone(),
+                        )));
+                    }
+                }
+                Err(e) => warn!(vector = "quic_flood", error = %e, "QUIC endpoint setup failed — skipping"),
+            },
         }
     }
 

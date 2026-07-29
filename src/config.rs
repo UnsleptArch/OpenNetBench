@@ -60,10 +60,13 @@ pub enum Vector {
     /// L7 — WebSocket exhaustion: completes real upgrade handshakes and holds the
     /// sessions open with keepalive frames, saturating the server's WS capacity.
     WebSocket,
+    /// L4/5 — QUIC/HTTP-3 handshake exhaustion: churns full QUIC connections over
+    /// UDP, forcing asymmetric TLS 1.3 crypto per handshake on the server.
+    QuicFlood,
 }
 
 impl Vector {
-    pub const ALL: [Vector; 19] = [
+    pub const ALL: [Vector; 20] = [
         Vector::HttpFlood,
         Vector::HttpsOnly,
         Vector::H2RapidReset,
@@ -83,6 +86,7 @@ impl Vector {
         Vector::CacheBust,
         Vector::HeaderFlood,
         Vector::WebSocket,
+        Vector::QuicFlood,
     ];
 
     /// Resolve a vector from its slug (for `--vectors` flag parsing).
@@ -111,6 +115,7 @@ impl Vector {
             Vector::CacheBust => "cache_bust",
             Vector::HeaderFlood => "header_flood",
             Vector::WebSocket => "websocket",
+            Vector::QuicFlood => "quic_flood",
         }
     }
 
@@ -120,7 +125,8 @@ impl Vector {
             | Vector::UdpFlood
             | Vector::TcpExhaust
             | Vector::TlsExhaust
-            | Vector::AckFlood => "L4",
+            | Vector::AckFlood
+            | Vector::QuicFlood => "L4",
             Vector::IcmpFlood => "L3",
             _ => "L7",
         }
@@ -172,6 +178,7 @@ impl Vector {
             Vector::CacheBust => "Cache-busting HTTP flood — unique query per request, hits the origin not the CDN",
             Vector::HeaderFlood => "Header-amplification flood — huge/numerous headers, costly to parse",
             Vector::WebSocket => "WebSocket exhaustion — hold upgraded sessions open, saturate WS capacity",
+            Vector::QuicFlood => "QUIC/HTTP-3 handshake exhaustion — churn QUIC connections, asymmetric server crypto",
         }
     }
 }
