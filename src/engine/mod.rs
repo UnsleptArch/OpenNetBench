@@ -66,6 +66,10 @@ pub struct Metrics {
     pub http_3xx: AtomicU64,
     pub http_4xx: AtomicU64,
     pub http_403: AtomicU64,
+    /// 408 Request Timeout — the server gave up reading our request under load.
+    /// Kept apart from the 4xx bucket because it's a server-stress signal, not a
+    /// client error like a 404.
+    pub http_408: AtomicU64,
     pub http_429: AtomicU64,
     pub http_5xx: AtomicU64,
     hist: Histogram,
@@ -84,6 +88,7 @@ impl Metrics {
             http_3xx: AtomicU64::new(0),
             http_4xx: AtomicU64::new(0),
             http_403: AtomicU64::new(0),
+            http_408: AtomicU64::new(0),
             http_429: AtomicU64::new(0),
             http_5xx: AtomicU64::new(0),
             hist: Histogram::new(),
@@ -103,6 +108,7 @@ impl Metrics {
             200..=299 => &self.http_2xx,
             300..=399 => &self.http_3xx,
             403 => &self.http_403,
+            408 => &self.http_408,
             429 => &self.http_429,
             400..=499 => &self.http_4xx,
             500..=599 => &self.http_5xx,
@@ -666,6 +672,7 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
         http_3xx: agg(&metrics_all, |m| m.http_3xx.load(Relaxed)),
         http_4xx: agg(&metrics_all, |m| m.http_4xx.load(Relaxed)),
         http_403: agg(&metrics_all, |m| m.http_403.load(Relaxed)),
+        http_408: agg(&metrics_all, |m| m.http_408.load(Relaxed)),
         http_429: agg(&metrics_all, |m| m.http_429.load(Relaxed)),
         http_5xx: agg(&metrics_all, |m| m.http_5xx.load(Relaxed)),
         baseline_ms: ctx.baseline_ms,
@@ -1144,46 +1151,13 @@ fn derive_outcome(samples: &[LatencySample], recon_baseline: Option<f64>) -> Run
     o.baseline_p99_ms = baseline;
     let Some(base) = baseline else { return o };
 
-    // Degradation must be SUSTAINED: mark the knee only after a run of
-    // consecutive breaching samples, and time-to-degradation at the run's start.
-    // Recovery is symmetric — p99 back within 1.5× baseline for a full run.
-    let mut over_run = 0usize;
-    let mut over_start: Option<(u64, u32)> = None;
-    let mut under_run = 0usize;
-    let mut degraded_at: Option<u64> = None;
-    for s in samples {
-        let breached =
-            s.p99_ms > base * 3.0 && s.p99_ms - base > classify::MIN_DEGRADE_DELTA_MS;
-        match degraded_at {
-            None => {
-                if breached {
-                    if over_run == 0 {
-                        over_start = Some((s.t_ms, s.concurrency));
-                    }
-                    over_run += 1;
-                    if over_run >= classify::DEGRADE_CONSECUTIVE {
-                        let (t, knee) = over_start.unwrap_or((s.t_ms, s.concurrency));
-                        degraded_at = Some(t);
-                        o.time_to_degradation_ms = Some(t);
-                        o.knee_concurrency = Some(knee);
-                    }
-                } else {
-                    over_run = 0;
-                    over_start = None;
-                }
-            }
-            Some(deg_t) => {
-                if s.p99_ms <= base * 1.5 {
-                    under_run += 1;
-                    if under_run >= classify::DEGRADE_CONSECUTIVE {
-                        o.recovery_time_ms = Some(s.t_ms.saturating_sub(deg_t));
-                        break;
-                    }
-                } else {
-                    under_run = 0;
-                }
-            }
-        }
+    // Same sustained-degradation detection the classifier uses, so the reported
+    // knee/recovery can never disagree with the verdict's evidence.
+    let threshold = classify::breach_threshold(samples, base);
+    if let Some(d) = classify::detect_degradation(samples, base, threshold) {
+        o.time_to_degradation_ms = Some(d.knee_t_ms);
+        o.knee_concurrency = Some(d.knee_concurrency);
+        o.recovery_time_ms = d.recovery_ms;
     }
     o
 }

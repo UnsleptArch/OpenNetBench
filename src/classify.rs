@@ -18,30 +18,129 @@ pub const MIN_DEGRADE_DELTA_MS: f64 = 25.0;
 /// GC) from genuine sustained exhaustion. 3 samples ≈ 0.75 s.
 pub const DEGRADE_CONSECUTIVE: usize = 3;
 
-/// The peak p99 within any run of at least [`DEGRADE_CONSECUTIVE`] consecutive
-/// samples that breached both the 3× ratio and the absolute delta over baseline.
-/// `None` if no such sustained run exists (i.e. only transient spikes).
-pub fn sustained_high_p99(samples: &[LatencySample], base: f64) -> Option<f64> {
+/// Baseline-ratio floor: p99 must reach at least this multiple of baseline.
+const DEGRADE_RATIO: f64 = 3.0;
+
+/// How many MADs above the quiet-baseline median counts as "clearly above noise".
+/// ~5·MAD ≈ 3.4·σ, so a stable target almost never trips it by chance while a
+/// jittery one is required to move further before we call it degraded.
+const NOISE_K: f64 = 5.0;
+
+/// The p99 a sample must exceed to count as a degradation breach.
+///
+/// A flat `base × 3` multiplier treats a rock-stable 2 ms target and a jittery
+/// 200 ms one identically — the first can't register a real 40 ms stall, the
+/// second cries wolf on ordinary variance. So the threshold is the strongest of
+/// three floors: the ratio (`base × 3`), an absolute delta (`base + 25 ms`, kills
+/// sub-ms noise), and a noise-relative bar (`median + 5·MAD` of the run's own
+/// quiet prefix). The noise term binds in the middle — moderate baseline, high
+/// jitter — exactly where the flat ratio misjudges.
+pub fn breach_threshold(samples: &[LatencySample], base: f64) -> f64 {
+    let mut floor = (base * DEGRADE_RATIO).max(base + MIN_DEGRADE_DELTA_MS);
+    // The quiet prefix: leading low-error samples that aren't already breaching
+    // the ratio floor, so the degradation itself can't poison the baseline.
+    let quiet: Vec<f64> = samples
+        .iter()
+        .take_while(|s| s.error_rate < 0.1 && s.p99_ms <= base * DEGRADE_RATIO)
+        .map(|s| s.p99_ms)
+        .take(8)
+        .collect();
+    if let (Some(med), Some(mad)) = (median(&quiet), mad(&quiet)) {
+        floor = floor.max(med + NOISE_K * mad);
+    }
+    floor
+}
+
+/// A sustained degradation found in the collapse curve, with where it started and
+/// whether the target recovered once load let up.
+#[derive(Debug, Clone, Copy)]
+pub struct Degradation {
+    /// Worst p99 observed from the knee onward.
+    pub peak_p99: f64,
+    /// Time (ms into the run) the sustained breach began.
+    pub knee_t_ms: u64,
+    /// Concurrent load in flight when it began — the "it broke at N" number.
+    pub knee_concurrency: u32,
+    /// Time from knee to a sustained return under `base × 1.5`, if it recovered
+    /// within the run. `Some` is strong evidence the load caused it.
+    pub recovery_ms: Option<u64>,
+}
+
+/// Find the first *sustained* degradation (≥ [`DEGRADE_CONSECUTIVE`] consecutive
+/// samples over `threshold`) and describe it. `None` means only transient spikes,
+/// which are not a finding. Shared by the classifier and the outcome summary so
+/// the verdict and the reported knee can never disagree.
+pub fn detect_degradation(
+    samples: &[LatencySample],
+    base: f64,
+    threshold: f64,
+) -> Option<Degradation> {
     if base <= 0.0 {
         return None;
     }
+    // Locate the knee: the start of the first run of breaching samples that
+    // reaches DEGRADE_CONSECUTIVE.
     let mut run = 0usize;
-    let mut run_peak = 0.0f64;
-    let mut best: Option<f64> = None;
-    for s in samples {
-        let breached = s.p99_ms > base * 3.0 && s.p99_ms - base > MIN_DEGRADE_DELTA_MS;
-        if breached {
+    let mut run_start: Option<(u64, u32)> = None;
+    let mut knee_idx = None;
+    for (i, s) in samples.iter().enumerate() {
+        if s.p99_ms > threshold {
+            if run == 0 {
+                run_start = Some((s.t_ms, s.concurrency));
+            }
             run += 1;
-            run_peak = run_peak.max(s.p99_ms);
             if run >= DEGRADE_CONSECUTIVE {
-                best = Some(best.map_or(run_peak, |b| b.max(run_peak)));
+                knee_idx = Some(i + 1 - DEGRADE_CONSECUTIVE);
+                break;
             }
         } else {
             run = 0;
-            run_peak = 0.0;
+            run_start = None;
         }
     }
-    best
+    let (knee_idx, (knee_t_ms, knee_concurrency)) = (knee_idx?, run_start?);
+
+    let peak_p99 = samples[knee_idx..]
+        .iter()
+        .map(|s| s.p99_ms)
+        .fold(threshold, f64::max);
+
+    // Recovery: a sustained run back under base × 1.5 after the knee.
+    let recovery_line = base * 1.5;
+    let mut under = 0usize;
+    let mut recovery_ms = None;
+    for s in &samples[knee_idx..] {
+        if s.p99_ms <= recovery_line {
+            under += 1;
+            if under >= DEGRADE_CONSECUTIVE {
+                recovery_ms = Some(s.t_ms.saturating_sub(knee_t_ms));
+                break;
+            }
+        } else {
+            under = 0;
+        }
+    }
+
+    Some(Degradation { peak_p99, knee_t_ms, knee_concurrency, recovery_ms })
+}
+
+/// Median of a slice (sorted copy); `None` if empty.
+fn median(xs: &[f64]) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
+}
+
+/// Median absolute deviation — robust spread that ignores the outliers a mean
+/// would chase. `None` if empty.
+fn mad(xs: &[f64]) -> Option<f64> {
+    let m = median(xs)?;
+    let devs: Vec<f64> = xs.iter().map(|x| (x - m).abs()).collect();
+    median(&devs)
 }
 
 /// What the observed behavior most likely means.
@@ -104,6 +203,7 @@ pub struct RunContext {
 }
 
 /// The observable signals the classifier reasons over.
+#[derive(Clone)]
 pub struct Signals {
     pub requests: u64,
     pub errors: u64,
@@ -111,6 +211,8 @@ pub struct Signals {
     pub http_3xx: u64,
     pub http_4xx: u64,
     pub http_403: u64,
+    /// 408 Request Timeout — server-stress signal, tracked apart from other 4xx.
+    pub http_408: u64,
     pub http_429: u64,
     pub http_5xx: u64,
     pub baseline_ms: Option<f64>,
@@ -170,56 +272,99 @@ pub fn detect_waf(server: Option<&str>) -> Option<String> {
 pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     let mut ev = Vec::new();
 
+    // --- Derived metrics, computed once so every section can corroborate. ---
+    let responses = sig.http_2xx
+        + sig.http_3xx
+        + sig.http_4xx
+        + sig.http_403
+        + sig.http_408
+        + sig.http_429
+        + sig.http_5xx;
+    let peak_p99 = samples.iter().map(|s| s.p99_ms).fold(0.0_f64, f64::max);
+    let base = sig.baseline_ms.or_else(|| {
+        samples
+            .iter()
+            .find(|s| s.error_rate < 0.1 && s.p99_ms > 0.0)
+            .map(|s| s.p99_ms)
+    });
+    let tail_err = tail_error_rate(samples);
+    let degradation =
+        base.and_then(|b| detect_degradation(samples, b, breach_threshold(samples, b)));
+    let server_err_frac = if responses > 0 {
+        (sig.http_5xx + sig.http_408) as f64 / responses as f64
+    } else {
+        0.0
+    };
+
+    // Independent indicators that the *target* (not our own box) was impacted.
+    // A verdict several of these agree on is reported with higher confidence than
+    // one resting on a single measurement — see `corroborate`.
+    let probe_conclusive = sig.probe_total.saturating_sub(sig.probe_local_inconclusive);
+    let probe_reliable = sig.probe_local_inconclusive * 2 <= sig.probe_total;
+    let probe_fail_frac = if probe_reliable && probe_conclusive > 0 {
+        sig.probe_failures as f64 / probe_conclusive as f64
+    } else {
+        0.0
+    };
+    let service_fail_frac = if sig.service_baseline_ok && sig.service_checks > 0 {
+        sig.service_failures as f64 / sig.service_checks as f64
+    } else {
+        0.0
+    };
+    let stress = (probe_fail_frac > 0.3) as u32
+        + (service_fail_frac > 0.25) as u32
+        + degradation.is_some() as u32
+        + (server_err_frac > 0.3) as u32;
+
     // 0. Health probe — independent ground truth about the target's availability.
     // This is the only signal that works for L4/raw vectors, and it overrides the
     // rest when it shows real impact.
     if sig.probe_total > 0 {
-        if let Some(base) = sig.probe_baseline_ms {
+        if let Some(pbase) = sig.probe_baseline_ms {
+            let local = sig.probe_local_inconclusive;
             // Probes that failed because *we* ran out of local sockets/ports say
             // nothing about the target. If they dominate, the probe is unreliable
             // this run — don't let it decide anything; note it and fall through.
-            let local = sig.probe_local_inconclusive;
-            let conclusive = sig.probe_total.saturating_sub(local);
-            if local * 2 > sig.probe_total {
+            if !probe_reliable {
                 ev.push(format!(
                     "health probe unreliable: {}/{} checks failed on LOCAL socket exhaustion \
                      (our machine, not the target) — reduce per-vector concurrency for a clean read",
                     local, sig.probe_total
                 ));
-            } else if conclusive > 0 {
-                let fail_frac = sig.probe_failures as f64 / conclusive as f64;
-                let peak = sig.probe_peak_ms.unwrap_or(base);
-                if fail_frac > 0.3 {
+            } else if probe_conclusive > 0 {
+                let peak = sig.probe_peak_ms.unwrap_or(pbase);
+                if probe_fail_frac > 0.3 {
                     ev.push(format!(
                         "health probe: {:.0}% of conclusive connection checks to the target \
                          FAILED under load",
-                        fail_frac * 100.0
+                        probe_fail_frac * 100.0
                     ));
                     if local > 0 {
                         ev.push(format!("({local} further checks were inconclusive — local limits)"));
                     }
-                    let verdict = if fail_frac > 0.7 { Verdict::Down } else { Verdict::Degrading };
+                    let verdict =
+                        if probe_fail_frac > 0.7 { Verdict::Down } else { Verdict::Degrading };
                     return Classification {
                         verdict,
-                        confidence: (0.6 + fail_frac * 0.3).min(0.9),
+                        confidence: corroborate(0.6 + probe_fail_frac * 0.3, stress),
                         evidence: ev,
                     };
                 }
-                if base > 0.0 && peak > base * 3.0 && peak - base > MIN_DEGRADE_DELTA_MS {
+                if pbase > 0.0 && peak > pbase * 3.0 && peak - pbase > MIN_DEGRADE_DELTA_MS {
                     ev.push(format!(
-                        "health probe connect latency rose {base:.1}ms → {peak:.1}ms under load ({:.1}x)",
-                        peak / base
+                        "health probe connect latency rose {pbase:.1}ms → {peak:.1}ms under load ({:.1}x)",
+                        peak / pbase
                     ));
                     return Classification {
                         verdict: Verdict::Degrading,
-                        confidence: 0.8,
+                        confidence: corroborate(0.8, stress),
                         evidence: ev,
                     };
                 }
                 ev.push(format!(
-                    "health probe stable ({base:.1}ms baseline, {}/{} conclusive checks ok)",
-                    conclusive - sig.probe_failures,
-                    conclusive
+                    "health probe stable ({pbase:.1}ms baseline, {}/{} conclusive checks ok)",
+                    probe_conclusive - sig.probe_failures,
+                    probe_conclusive
                 ));
             }
         }
@@ -232,17 +377,17 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     // app answered at baseline, and only reaches here when the TCP probe didn't
     // already return a verdict — i.e. TCP looked fine.
     if sig.service_baseline_ok && sig.service_checks > 0 {
-        let sfail = sig.service_failures as f64 / sig.service_checks as f64;
-        if sfail > 0.25 {
+        if service_fail_frac > 0.25 {
             ev.push(format!(
                 "service probe: {:.0}% of independent requests got no usable answer under load, \
                  while the target still accepted TCP connections",
-                sfail * 100.0
+                service_fail_frac * 100.0
             ));
-            let verdict = if sfail > 0.6 { Verdict::Down } else { Verdict::Degrading };
+            let verdict =
+                if service_fail_frac > 0.6 { Verdict::Down } else { Verdict::Degrading };
             return Classification {
                 verdict,
-                confidence: (0.6 + sfail * 0.3).min(0.9),
+                confidence: corroborate(0.6 + service_fail_frac * 0.3, stress),
                 evidence: ev,
             };
         }
@@ -266,18 +411,6 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
         ev.push("L4/raw vectors only and no health-probe signal — can't assess".into());
         return Classification { verdict: Verdict::Unknown, confidence: 0.0, evidence: ev };
     }
-
-    let responses =
-        sig.http_2xx + sig.http_3xx + sig.http_4xx + sig.http_403 + sig.http_429 + sig.http_5xx;
-
-    let peak_p99 = samples.iter().map(|s| s.p99_ms).fold(0.0_f64, f64::max);
-    let base = sig.baseline_ms.or_else(|| {
-        samples
-            .iter()
-            .find(|s| s.error_rate < 0.1 && s.p99_ms > 0.0)
-            .map(|s| s.p99_ms)
-    });
-    let tail_err = tail_error_rate(samples);
 
     // 1. Rate limiter — 429s are an unambiguous mitigation signal.
     if responses > 0 {
@@ -307,33 +440,73 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
         }
     }
 
-    // 3. Resource exhaustion — p99 blew past baseline under load, by both a
-    // meaningful ratio AND a meaningful absolute amount (filters sub-ms noise),
-    // AND for a SUSTAINED window (a single transient spike is not degradation).
-    if let Some(base) = base {
-        if let Some(sustained_p99) = sustained_high_p99(samples, base) {
+    // 3. Resource exhaustion — a SUSTAINED p99 breach over the noise-relative
+    // threshold. Beyond detecting it, we test whether *we* caused it: did the
+    // breach track the rising load (knee concurrency above the quiet baseline),
+    // and did p99 recover once load eased? Both are what separates "we broke it"
+    // from "something else hiccuped", and both raise confidence.
+    if let (Some(b), Some(d)) = (base, degradation) {
+        ev.push(format!(
+            "p99 held at {:.1}ms vs {:.1}ms baseline ({:.1}x); knee at ~{} concurrent, {:.1}s in",
+            d.peak_p99,
+            b,
+            d.peak_p99 / b,
+            d.knee_concurrency,
+            d.knee_t_ms as f64 / 1000.0
+        ));
+        let baseline_conc = samples.first().map(|s| s.concurrency).unwrap_or(0);
+        let mut caus = 0u32;
+        if d.knee_concurrency > baseline_conc {
             ev.push(format!(
-                "p99 held at {:.1}ms vs {:.1}ms baseline ({:.1}x) for {}+ consecutive samples",
-                sustained_p99,
-                base,
-                sustained_p99 / base,
-                DEGRADE_CONSECUTIVE
+                "degradation tracked the load ramp (rose to {} concurrent) — consistent with us causing it",
+                d.knee_concurrency
             ));
-            // Down if the tail shows near-total failure; else degrading.
-            if tail_err > 0.8 || (responses > 0 && sig.http_5xx as f64 / responses as f64 > 0.5) {
-                ev.push(format!("tail error rate {:.0}%", tail_err * 100.0));
-                return Classification {
-                    verdict: Verdict::Down,
-                    confidence: 0.8,
-                    evidence: ev,
-                };
-            }
+            caus += 1;
+        }
+        if let Some(rec) = d.recovery_ms {
+            ev.push(format!(
+                "p99 recovered ~{:.1}s after load eased — load-induced, not a pre-existing fault",
+                rec as f64 / 1000.0
+            ));
+            caus += 1;
+        }
+        if caus == 0 {
+            ev.push("load-correlation unclear (flat concurrency, no recovery window seen)".into());
+        }
+        // Down if the tail shows near-total failure; else degrading.
+        if tail_err > 0.8 || (responses > 0 && sig.http_5xx as f64 / responses as f64 > 0.5) {
+            ev.push(format!("tail error rate {:.0}%", tail_err * 100.0));
             return Classification {
-                verdict: Verdict::Degrading,
-                confidence: 0.7,
+                verdict: Verdict::Down,
+                confidence: (corroborate(0.75, stress) + 0.05 * caus as f64).min(0.9),
                 evidence: ev,
             };
         }
+        return Classification {
+            verdict: Verdict::Degrading,
+            confidence: (corroborate(0.65, stress) + 0.05 * caus as f64).min(0.9),
+            evidence: ev,
+        };
+    }
+
+    // 3b. Server erroring under load without a latency blowup — an app that fails
+    // fast behind a proxy answers instantly with 5xx/408, so the latency rule
+    // above never fires. High server-error rate is a finding on its own.
+    if responses > 0 && server_err_frac > 0.2 {
+        let frac_5xx = sig.http_5xx as f64 / responses as f64;
+        let frac_408 = sig.http_408 as f64 / responses as f64;
+        ev.push(format!(
+            "{:.0}% of responses were server errors under load ({:.0}% 5xx, {:.0}% 408 timeout)",
+            server_err_frac * 100.0,
+            frac_5xx * 100.0,
+            frac_408 * 100.0
+        ));
+        let verdict = if server_err_frac > 0.5 { Verdict::Down } else { Verdict::Degrading };
+        return Classification {
+            verdict,
+            confidence: corroborate(0.6 + server_err_frac * 0.3, stress),
+            evidence: ev,
+        };
     }
 
     // 4. No application responses at all despite L7 attempts → edge/down.
@@ -388,14 +561,25 @@ fn conf(fraction: f64, max: f64) -> f64 {
     (0.4 + fraction * 0.6).min(max)
 }
 
+/// Raise a base confidence by how many *independent* signals agree with the
+/// verdict beyond the one that triggered it. One signal is the base; each extra
+/// corroborating signal adds a little. Capped at 0.9 — we report likelihood.
+fn corroborate(base: f64, agreeing_signals: u32) -> f64 {
+    (base + 0.05 * agreeing_signals.saturating_sub(1) as f64).min(0.9)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sample(p99: f64, err: f64) -> LatencySample {
+        sample_at(0, 10, p99, err)
+    }
+
+    fn sample_at(t_ms: u64, concurrency: u32, p99: f64, err: f64) -> LatencySample {
         LatencySample {
-            t_ms: 0,
-            concurrency: 10,
+            t_ms,
+            concurrency,
             p50_ms: p99 / 2.0,
             p95_ms: p99 * 0.9,
             p99_ms: p99,
@@ -411,6 +595,7 @@ mod tests {
             http_3xx: 0,
             http_4xx: 0,
             http_403: 0,
+            http_408: 0,
             http_429: 0,
             http_5xx: 0,
             baseline_ms: Some(10.0),
@@ -608,5 +793,142 @@ mod tests {
         assert_eq!(detect_waf(Some("cloudflare")).as_deref(), Some("Cloudflare"));
         assert_eq!(detect_waf(Some("nginx/1.25")), None);
         assert_eq!(detect_waf(None), None);
+    }
+
+    // --- W1: causation (load correlation + recovery + knee) ---
+
+    #[test]
+    fn degradation_tracking_the_load_ramp_is_more_confident_and_reports_the_knee() {
+        let mut s = base_signals();
+        s.http_2xx = 1000;
+        // p99 blows up as concurrency climbs — a curve we plausibly caused.
+        let rising = [
+            sample_at(0, 5, 10.0, 0.0),
+            sample_at(250, 10, 10.0, 0.0),
+            sample_at(500, 100, 120.0, 0.05),
+            sample_at(750, 150, 120.0, 0.05),
+            sample_at(1000, 200, 120.0, 0.05),
+        ];
+        // Same p99 curve, but concurrency never moved — correlation is unclear.
+        let flat = [
+            sample_at(0, 10, 10.0, 0.0),
+            sample_at(250, 10, 10.0, 0.0),
+            sample_at(500, 10, 120.0, 0.05),
+            sample_at(750, 10, 120.0, 0.05),
+            sample_at(1000, 10, 120.0, 0.05),
+        ];
+        let a = classify(&s, &rising);
+        let b = classify(&s, &flat);
+        assert_eq!(a.verdict, Verdict::Degrading);
+        assert_eq!(b.verdict, Verdict::Degrading);
+        assert!(a.confidence > b.confidence, "load-correlated degradation should be more certain");
+        assert!(
+            a.evidence.iter().any(|e| e.contains("tracked the load ramp")),
+            "should credit the load correlation"
+        );
+        assert!(
+            a.evidence.iter().any(|e| e.contains("knee at ~100 concurrent")),
+            "should report the concurrency at the knee"
+        );
+    }
+
+    #[test]
+    fn recovery_after_load_eases_is_detected() {
+        let base = 10.0;
+        let samples = [
+            sample_at(0, 5, 10.0, 0.0),
+            sample_at(250, 50, 120.0, 0.05),
+            sample_at(500, 100, 120.0, 0.05),
+            sample_at(750, 150, 120.0, 0.05),
+            sample_at(1000, 20, 12.0, 0.0),
+            sample_at(1250, 10, 11.0, 0.0),
+            sample_at(1500, 5, 10.0, 0.0),
+        ];
+        let d = detect_degradation(&samples, base, breach_threshold(&samples, base))
+            .expect("sustained breach");
+        assert_eq!(d.knee_concurrency, 50);
+        assert_eq!(d.recovery_ms, Some(1250));
+    }
+
+    // --- W3: noise-relative threshold ---
+
+    #[test]
+    fn jitter_within_a_targets_own_noise_band_is_not_degradation() {
+        // A moderate-latency target whose p99 normally swings 40–140 ms. A flat 3×
+        // rule (150 ms) would fire on the 200 ms samples; the noise-relative bar
+        // (median + 5·MAD of the jittery baseline) must not.
+        let mut s = base_signals();
+        s.baseline_ms = Some(50.0);
+        s.http_2xx = 1000;
+        let samples = [
+            sample_at(0, 10, 40.0, 0.0),
+            sample_at(250, 20, 130.0, 0.0),
+            sample_at(500, 30, 50.0, 0.0),
+            sample_at(750, 40, 140.0, 0.0),
+            sample_at(1000, 50, 45.0, 0.0),
+            sample_at(1250, 60, 135.0, 0.0),
+            sample_at(1500, 70, 200.0, 0.0),
+            sample_at(1750, 80, 205.0, 0.0),
+            sample_at(2000, 90, 210.0, 0.0),
+        ];
+        let c = classify(&s, &samples);
+        assert_ne!(c.verdict, Verdict::Degrading, "ordinary jitter must not read as a finding");
+        assert_ne!(c.verdict, Verdict::Down);
+    }
+
+    // --- W4: 5xx / 408 blind spots ---
+
+    #[test]
+    fn fast_5xx_without_latency_blowup_is_down() {
+        let mut s = base_signals();
+        s.http_2xx = 100;
+        s.http_5xx = 900; // app fails fast behind a proxy — instant 502s
+        let samples = [sample(10.0, 0.0), sample(11.0, 0.0)]; // no latency signal
+        let c = classify(&s, &samples);
+        assert_eq!(c.verdict, Verdict::Down);
+        assert!(c.verdict.is_finding());
+        assert!(c.evidence.iter().any(|e| e.contains("server errors")));
+    }
+
+    #[test]
+    fn request_timeouts_408_count_as_server_stress() {
+        let mut s = base_signals();
+        s.http_2xx = 600;
+        s.http_408 = 400; // server timing out reading our requests under load
+        let samples = [sample(10.0, 0.0), sample(11.0, 0.0)];
+        let c = classify(&s, &samples);
+        assert_eq!(c.verdict, Verdict::Degrading);
+        assert!(c.evidence.iter().any(|e| e.contains("408")));
+    }
+
+    // --- W2/W5: multi-signal corroboration ---
+
+    #[test]
+    fn corroborating_signals_raise_confidence() {
+        // Lone probe failure vs. the same probe failure with the service probe,
+        // the latency curve, and the 5xx rate all agreeing.
+        let mut lone = base_signals();
+        lone.probe_baseline_ms = Some(5.0);
+        lone.probe_total = 10;
+        lone.probe_failures = 4; // 40% — Degrading
+
+        let mut corr = lone.clone();
+        corr.service_baseline_ok = true;
+        corr.service_checks = 10;
+        corr.service_failures = 3; // 30% service failure
+        corr.http_2xx = 600;
+        corr.http_5xx = 400; // 40% server errors
+        let samples = [
+            sample(10.0, 0.0),
+            sample(120.0, 0.05),
+            sample(120.0, 0.05),
+            sample(120.0, 0.05),
+        ];
+
+        let a = classify(&lone, &[]);
+        let b = classify(&corr, &samples);
+        assert_eq!(a.verdict, Verdict::Degrading);
+        assert_eq!(b.verdict, Verdict::Degrading);
+        assert!(b.confidence > a.confidence, "agreement across signals should raise confidence");
     }
 }
