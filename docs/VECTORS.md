@@ -1,6 +1,6 @@
 # Vectors
 
-Sixteen of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
+Eighteen of them, L3 up to L7. Each one models a real denial-of-service pattern, not synthetic filler. Grouped here by what they attack rather than by layer, because that is how you actually pick them.
 
 Every vector shares the same skeleton. It gates on its own governor so ramp-up and adaptive throttle work per vector, it races a shutdown watch so stopping the process stops the traffic within the drain grace, and it records into its own lock-free metrics so one distressed vector never throttles a healthy one.
 
@@ -9,6 +9,10 @@ Every vector shares the same skeleton. It gates on its own governor so ramp-up a
 **http_flood** and **https_only.** Keep-alive HTTP/1.1 GET loop, zero allocation in the hot path, parsed with httparse, body drained but bounded. It honors the response keep-alive so a clean server-side close is a clean reconnect and not a fake error, which matters against things like Python's `http.server` that close every response. This is the bread-and-butter request flood.
 
 **range_flood.** CVE-2011-3192, the old Apache byte-range trick. Sends a request carrying a big pile of overlapping `Range` headers so the server tries to buffer a huge number of overlapping segments and blows up its own memory. Reuses the http_flood worker with a different request template.
+
+**cache_bust.** The http_flood worker with a unique `?_cb=<id>` query spliced into every request. A cached endpoint behind a CDN or reverse proxy answers a plain flood for free out of cache and the origin never feels it. A distinct URL per request misses the cache key every time, so the load actually lands on the origin. This is how you measure origin resilience instead of cache performance. The splice touches only the request line and allocates nothing in the loop.
+
+**header_flood.** Same GET, pathological headers. A big Cookie, a stack of duplicate `X-Forwarded-For`, an exploded `Accept-Language`, and a wall of custom headers. Cheap for us to send, but the server has to parse, allocate and often validate a large header set on every single request. That is parser CPU, a different axis than body or connection floods. Sized to stay under the usual 8 to 16KB header limits so a normal server parses it instead of fast-rejecting with a 431.
 
 **h2_flood.** Full multiplexed HTTP/2. Real requests over a real h2 connection, completed and drained, latency recorded. This is the modern equivalent of the plain request flood for HTTP/2 servers.
 
