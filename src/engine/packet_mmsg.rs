@@ -138,17 +138,33 @@ impl AfPacketMmsg {
         })
     }
 
-    /// Flush the buffered frames with one `sendmmsg()`.
-    fn flush(&mut self) -> io::Result<()> {
+    /// Flush the buffered frames with one non-blocking `sendmmsg()`.
+    ///
+    /// Returns `Ok(true)` when the kernel accepted at least one frame, `Ok(false)`
+    /// when the send would block (TX ring full — backpressure, nothing sent), and
+    /// `Err` on a real send error. The `MSG_DONTWAIT` is what keeps the shard loop
+    /// cooperative: a *blocking* `sendmmsg` on a congested NIC (e.g. wlan0's airtime
+    /// cap, with the qdisc bypassed) parks the thread in-syscall so it never
+    /// re-checks `shutdown`, and the leader task is `spawn_blocking` — which `abort`
+    /// can't cancel — so the whole run would hang past its duration.
+    fn flush(&mut self) -> io::Result<bool> {
         if self.count == 0 {
-            return Ok(());
+            return Ok(true);
         }
-        let n = unsafe { libc::sendmmsg(self.fd, self.msgs.as_mut_ptr(), self.count as u32, 0) };
+        let n = unsafe {
+            libc::sendmmsg(self.fd, self.msgs.as_mut_ptr(), self.count as u32, libc::MSG_DONTWAIT)
+        };
         self.count = 0;
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            // Ring full: nothing went out this flush, but it's not a failure — the
+            // caller drops the batch and loops, re-checking shutdown as it goes.
+            if e.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(false);
+            }
+            return Err(e);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -161,7 +177,9 @@ impl PacketTx for AfPacketMmsg {
         self.frames[off..off + l4.len()].copy_from_slice(l4);
         self.count += 1;
         if self.count == BATCH {
-            self.flush()?;
+            // This frame rides the batch we just filled, so it shares its fate:
+            // sent (Ok(true)) or dropped under backpressure (Ok(false)).
+            return self.flush();
         }
         Ok(true)
     }

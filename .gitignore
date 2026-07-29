@@ -24,6 +24,9 @@
 .DS_Store
 Thumbs.db
 
+# Local dev tooling — not for the public repo
+/dev
+
 # Env / secrets — never commit these
 .env
 .env.*
