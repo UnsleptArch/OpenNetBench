@@ -19,7 +19,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use tokio_socks::tcp::Socks5Stream;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A parsed SOCKS5 proxy the TCP load path dials through.
 pub struct ProxySpec {

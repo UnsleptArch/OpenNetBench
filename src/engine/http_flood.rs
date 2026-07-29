@@ -88,22 +88,26 @@ pub async fn worker(
             next_tick += iv;
         }
 
-        // Ensure a live connection.
+        // Ensure a live connection. The connect must race the stop signal, or a
+        // worker parked in it against an overwhelmed target won't observe shutdown
+        // and the drain force-aborts it after the grace window (run overshoot).
         if live.is_none() {
-            match target.connect().await {
-                Ok(conn) => {
-                    live = Some(Live {
-                        conn,
-                        _held: HeldGuard::new(&metrics.held_connections),
-                    });
-                }
-                Err(_) => {
-                    metrics.errors.fetch_add(1, Relaxed);
-                    fail_streak = fail_streak.saturating_add(1);
-                    sleep_or_stop(&mut down, backoff(fail_streak, &mut rng)).await;
-                    continue;
-                }
-            }
+            let conn = tokio::select! {
+                r = target.connect() => match r {
+                    Ok(conn) => conn,
+                    Err(_) => {
+                        metrics.errors.fetch_add(1, Relaxed);
+                        fail_streak = fail_streak.saturating_add(1);
+                        sleep_or_stop(&mut down, backoff(fail_streak, &mut rng)).await;
+                        continue;
+                    }
+                },
+                _ = down.changed() => break,
+            };
+            live = Some(Live {
+                conn,
+                _held: HeldGuard::new(&metrics.held_connections),
+            });
         }
 
         let l = live.as_mut().unwrap();

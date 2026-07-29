@@ -77,16 +77,21 @@ pub async fn worker(
             continue;
         }
 
-        let mut io = match target.connect_h2().await {
-            Ok(io) => io,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                tokio::select! {
-                    _ = down.changed() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        // Race the connect against stop so a worker parked mid-handshake on an
+        // overwhelmed target observes shutdown instead of being force-aborted.
+        let mut io = tokio::select! {
+            r = target.connect_h2() => match r {
+                Ok(io) => io,
+                Err(_) => {
+                    metrics.errors.fetch_add(1, Relaxed);
+                    tokio::select! {
+                        _ = down.changed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                    continue;
                 }
-                continue;
-            }
+            },
+            _ = down.changed() => return,
         };
 
         if io.write_all(&init).await.is_err() {

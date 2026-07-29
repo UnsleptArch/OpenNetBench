@@ -41,17 +41,22 @@ pub async fn worker(
             continue;
         }
 
-        // Open and hold one connection.
-        let mut conn = match target.connect().await {
-            Ok(c) => c,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                tokio::select! {
-                    _ = down.changed() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        // Open and hold one connection. The connect must race the stop signal, or
+        // a worker parked in it against an overwhelmed target won't observe
+        // shutdown and the drain force-aborts it after the grace window.
+        let mut conn = tokio::select! {
+            r = target.connect() => match r {
+                Ok(c) => c,
+                Err(_) => {
+                    metrics.errors.fetch_add(1, Relaxed);
+                    tokio::select! {
+                        _ = down.changed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                    continue;
                 }
-                continue;
-            }
+            },
+            _ = down.changed() => return,
         };
         let _held = HeldGuard::new(&metrics.held_connections);
         metrics.requests_sent.fetch_add(1, Relaxed);

@@ -35,27 +35,34 @@ pub async fn worker(
         let t0 = Instant::now();
         metrics.requests_sent.fetch_add(1, Relaxed);
 
-        let tcp = match target.connect_tcp().await {
-            Ok(s) => s,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                continue;
-            }
+        // Both the TCP connect and the TLS handshake must race the stop signal —
+        // against an overwhelmed target either can park for the full connect
+        // timeout (or, for the handshake, forever), and an unraced worker won't
+        // drain until the grace window force-aborts it (the run's overshoot).
+        let tcp = tokio::select! {
+            r = target.connect_tcp() => match r {
+                Ok(s) => s,
+                Err(_) => {
+                    metrics.errors.fetch_add(1, Relaxed);
+                    continue;
+                }
+            },
+            _ = down.changed() => return,
         };
 
-        match target
-            .connector
-            .connect(target.server_name.clone(), tcp)
-            .await
-        {
-            Ok(stream) => {
-                metrics.record_latency(t0.elapsed());
-                metrics.responses_ok.fetch_add(1, Relaxed);
-                drop(stream); // tear down immediately, force a fresh handshake next
-            }
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-            }
+        let handshake = target.connector.connect(target.server_name.clone(), tcp);
+        tokio::select! {
+            r = tokio::time::timeout(super::net::CONNECT_TIMEOUT, handshake) => match r {
+                Ok(Ok(stream)) => {
+                    metrics.record_latency(t0.elapsed());
+                    metrics.responses_ok.fetch_add(1, Relaxed);
+                    drop(stream); // tear down immediately, force a fresh handshake next
+                }
+                _ => {
+                    metrics.errors.fetch_add(1, Relaxed);
+                }
+            },
+            _ = down.changed() => return,
         }
     }
 }

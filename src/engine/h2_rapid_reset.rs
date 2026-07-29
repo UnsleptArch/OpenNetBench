@@ -33,24 +33,34 @@ pub async fn worker(
             continue;
         }
 
-        let io = match target.connect_h2().await {
-            Ok(io) => io,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                tokio::select! {
-                    _ = down.changed() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        // Race every connect/handshake await against stop so shutdown cancels it
+        // immediately instead of the drain force-aborting a parked worker.
+        let io = tokio::select! {
+            r = target.connect_h2() => match r {
+                Ok(io) => io,
+                Err(_) => {
+                    metrics.errors.fetch_add(1, Relaxed);
+                    tokio::select! {
+                        _ = down.changed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                    continue;
                 }
-                continue;
-            }
+            },
+            _ = down.changed() => return,
         };
 
-        let (mut send_req, connection) = match h2::client::handshake(io).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                metrics.errors.fetch_add(1, Relaxed);
-                continue;
+        let (mut send_req, connection) = tokio::select! {
+            r = tokio::time::timeout(super::net::CONNECT_TIMEOUT, h2::client::handshake(io)) => {
+                match r {
+                    Ok(Ok(pair)) => pair,
+                    _ => {
+                        metrics.errors.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                }
             }
+            _ = down.changed() => return,
         };
         // The connection future must be driven for the client to make progress.
         let conn_task = tokio::spawn(async move { let _ = connection.await; });
