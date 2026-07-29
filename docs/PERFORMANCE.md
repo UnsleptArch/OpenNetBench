@@ -44,6 +44,39 @@ The key read is that the wifi 60K and the veth 3.4M were both delivery walls. Wh
 
 The trust rule for all of this: the wire truth is the NIC's `tx_packets` counter, not what the tool thinks it generated. On veth and dummy0 the generated count matched the counter closely, so no silent drops. On wifi they diverged wildly (759K generated, 60K on the wire), which is exactly how you spot a medium wall.
 
+## Formal methodology: isolating the send-side throughput ceiling
+
+The narrative above is the short version. This section states the same result in the register a reviewer would expect, because the figure is only as credible as the method that produced it.
+
+### Problem statement and design rationale
+
+Reported packet-generation figures are routinely confounded by the transport medium and by the instrumentation used to obtain them. A generator that emits frames faster than the attached link, the receiving host, or the local kernel can absorb will report an egress rate that reflects the narrowest downstream stage rather than the transmit code itself. To characterise the send path in isolation, its throughput ceiling must be decoupled from every downstream constraint: the physical medium, the receiver's softirq and delivery path, and the queueing-discipline and connection-tracking machinery of the local kernel.
+
+The measurement strategy treats each candidate bottleneck as a controlled variable and removes it in turn, observing the resulting egress rate at each step. The design follows the logic of successive substitution: if eliminating a suspected constraint raises the observed rate, that constraint was binding; if it does not, the ceiling lies elsewhere.
+
+### Apparatus
+
+All measurements were taken on a single host (AMD Ryzen 7800X3D, 8 physical cores and 16 hardware threads, 62 GiB RAM, Linux 7.1.4). The generator was configured with sixteen transmit shards, one pinned to each hardware thread via `sched_setaffinity`, each emitting 54-byte Ethernet frames through an AF_PACKET socket with `PACKET_QDISC_BYPASS` enabled and frames aggregated into batches of up to 1024 per `sendmmsg` call. Frame prefixes were precomputed once per shard, with only the layer-4 header rewritten per packet, so per-frame formatting cost is excluded from the measured path by construction.
+
+### Instrumentation and ground truth
+
+Two counters were recorded per run. The first is the generator's own accepted-frame count, that is, frames the kernel accepted from `sendmmsg`. The second, treated as authoritative, is the interface `tx_packets` delta read from `/sys/class/net/<iface>/statistics/tx_packets` across the run window. The two are expected to agree only when no stage downstream of the socket silently discards frames. Because `PACKET_QDISC_BYPASS` removes the backpressure that would otherwise throttle the sender to the link rate, divergence between the two counters is itself the diagnostic signal for a medium-imposed wall. All rates reported below are computed from the authoritative counter over the measured wall-clock interval.
+
+### Procedure and results
+
+Four transmit targets were used, each removing one more downstream constraint than the last:
+
+1. A physical 802.11 interface. Egress at the wire settled at approximately 60 Kpps while the generator accepted approximately 759 Kpps. The order-of-magnitude divergence localises the constraint to 802.11 airtime arbitration, a property of the half-duplex medium rather than of the generator.
+2. A virtual Ethernet (veth) pair terminated in a separate network namespace. Egress settled at approximately 3.4 Mpps and, decisively, was invariant to sender parallelism: sixteen pinned shards and five hundred unpinned workers produced the same ceiling. This localises the constraint to the single-pair delivery and receive-softirq path, not to the sender.
+3. A discard interface (dummy0) with a statically configured neighbour entry. This interface accepts and immediately discards transmitted frames, incrementing `tx_packets` without any receive-side processing or physical medium. Egress reached 25,640,853 pps (approximately 25.6 Mpps; 384.6 million frames over 15.03 seconds), with the accepted-frame count matching the interface counter to within measurement noise, indicating no silent loss.
+4. A virtio-net interface inside a hardware-virtualised guest, used to validate the AF_XDP transmit path against a known-good driver rather than to establish a throughput figure.
+
+### Interpretation and threats to validity
+
+The monotonic progression across successively less constrained targets (roughly 60 Kpps, then 3.4 Mpps, then 25.6 Mpps), together with the invariance of the veth result to sender parallelism, supports the conclusion that every figure below 25.6 Mpps was imposed by the delivery medium and not by the transmit code. The dummy0 result, obtained once every downstream constraint had been removed, is therefore taken as the send-side ceiling of the generator on this hardware: approximately 25.6 million packets per second, or about 1.7 times the theoretical 10GbE line rate for minimum-size frames (14.88 Mpps).
+
+Several limitations bound this claim. First, dummy0 exercises the driver transmit routine and interface accounting but not a physical PHY or DMA to real hardware, so the figure is an upper bound on generation capacity rather than a demonstrated wire rate; establishing the latter requires a wired, XDP-capable interface not present on the test host. Second, the result is specific to this processor, frame size, and shard count, and does not generalise to arbitrary hardware. Third, `tx_packets` attests driver acceptance rather than successful delivery, which is immaterial for a discard interface but would require external corroboration on a physical link. Within these bounds, the operationally relevant conclusion is unchanged: for any target at or below 10GbE the system is constrained by the network, not by the generator.
+
 ## AF_XDP versus AF_PACKET, which to use
 
 The batched AF_PACKET path already beats 10GbE line rate, so for almost every real target it is enough and it needs no special driver. Build it and forget it.
