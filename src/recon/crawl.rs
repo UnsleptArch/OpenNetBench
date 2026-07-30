@@ -119,7 +119,7 @@ const ASSET_EXTS: &[&str] = &[
 /// Mine a JS bundle for API endpoint literals — quoted absolute paths that look
 /// like API routes (contain an API marker, aren't static assets). Path templates
 /// (`:id`, `{id}`) are filled with a placeholder so the URL resolves.
-fn extract_js_endpoints(js: &str) -> Vec<String> {
+pub(crate) fn extract_js_endpoints(js: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for quote in ['"', '\''] {
         let mut from = 0;
@@ -207,13 +207,13 @@ impl Origin {
     }
 }
 
-enum RefKind {
+pub(crate) enum RefKind {
     Link,
     Form(String, Vec<String>), // method, field names
 }
 
 /// Scan HTML for `href`/`src` links and `<form ... action=... method=...>`.
-fn extract_refs(html: &str) -> Vec<(RefKind, String)> {
+pub(crate) fn extract_refs(html: &str) -> Vec<(RefKind, String)> {
     let mut out = Vec::new();
     let bytes = html.as_bytes();
 

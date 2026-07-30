@@ -15,7 +15,7 @@ const SUB_COUNT: u64 = 1 << SUB_BITS;
 
 /// Map a latency in microseconds to a bucket index. O(1).
 #[inline]
-fn bucket_of(us: u64) -> usize {
+pub(crate) fn bucket_of(us: u64) -> usize {
     let us = us.max(1);
     // Values below one full magnitude of sub-buckets are stored linearly.
     if us < SUB_COUNT {
@@ -29,7 +29,7 @@ fn bucket_of(us: u64) -> usize {
 
 /// Approximate microsecond value at the *midpoint* of a bucket. Inverse of
 /// `bucket_of`, used to turn a bucket index back into a latency for reporting.
-fn us_of(idx: usize) -> f64 {
+pub(crate) fn us_of(idx: usize) -> f64 {
     if idx < SUB_COUNT as usize {
         return idx as f64;
     }

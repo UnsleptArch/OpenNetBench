@@ -14,8 +14,8 @@
 //! POSTs are replayed only when they look like search/filter and NOT like an
 //! auth/delete/payment action.
 
-mod crawl;
-mod discover;
+pub(crate) mod crawl;
+pub(crate) mod discover;
 mod fingerprint;
 mod param;
 mod probe;

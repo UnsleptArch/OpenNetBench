@@ -104,7 +104,7 @@ async fn harvest_sitemap(client: &Client, url: &Url, out: &mut Vec<Discovered>) 
 }
 
 /// Parse robots.txt: returns (allow/disallow paths, sitemap URLs).
-fn parse_robots(text: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn parse_robots(text: &str) -> (Vec<String>, Vec<String>) {
     let mut paths = Vec::new();
     let mut sitemaps = Vec::new();
     for line in text.lines() {
@@ -131,7 +131,7 @@ fn parse_robots(text: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Extract `<loc>` URLs from a sitemap (or sitemap index).
-fn parse_sitemap(xml: &str) -> Vec<String> {
+pub(crate) fn parse_sitemap(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(start) = xml[from..].find("<loc>") {
@@ -146,14 +146,14 @@ fn parse_sitemap(xml: &str) -> Vec<String> {
     out
 }
 
-struct OpenApiOp {
+pub(crate) struct OpenApiOp {
     path: String,
     params: Vec<Param>,
 }
 
 /// Parse an OpenAPI/Swagger document into GET-able operations with their query
 /// parameters. Path templates like `/users/{id}` get a concrete placeholder.
-fn parse_openapi(v: &serde_json::Value) -> Vec<OpenApiOp> {
+pub(crate) fn parse_openapi(v: &serde_json::Value) -> Vec<OpenApiOp> {
     let mut out = Vec::new();
     let Some(paths) = v.get("paths").and_then(|p| p.as_object()) else {
         return out;

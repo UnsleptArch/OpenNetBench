@@ -258,7 +258,7 @@ async fn one_request(
 /// cache keys so the request reaches the origin. Inserts `?_cb=<id>` (or
 /// `&_cb=<id>` if the path already has a query) just before the ` HTTP/1.1` that
 /// ends the request line; the rest of the template is copied verbatim.
-fn cache_bust_into(template: &[u8], id: u64, out: &mut Vec<u8>) {
+pub(crate) fn cache_bust_into(template: &[u8], id: u64, out: &mut Vec<u8>) {
     out.clear();
     // The request line is everything before the first CRLF; " HTTP/" marks its end.
     let line_end = template

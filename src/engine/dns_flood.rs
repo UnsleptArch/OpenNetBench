@@ -27,7 +27,7 @@ impl XorShift {
 }
 
 /// Encode a DNS A query for `<rand>.<domain>` into `buf`; returns its length.
-fn encode_query(buf: &mut [u8], id: u16, rand: u64, domain: &str) -> usize {
+pub(crate) fn encode_query(buf: &mut [u8], id: u16, rand: u64, domain: &str) -> usize {
     // Header: ID, flags=0x0100 (RD), QDCOUNT=1, rest 0.
     buf[0..2].copy_from_slice(&id.to_be_bytes());
     buf[2..4].copy_from_slice(&0x0100u16.to_be_bytes());

@@ -6,22 +6,9 @@
 //! and no command-and-control. A consent gate — typed, or asserted explicitly
 //! with --i-am-authorized for unattended runs — precedes every run.
 
-// Scaffold stage: several types/functions are forward-declared for modules that
-// land in later increments (engine workers, web server, DB, CVE correlation).
-#![allow(dead_code)]
-
-mod auth;
-mod auto;
-mod classify;
-mod cli;
-mod config;
-mod db;
-mod engine;
-mod logging;
-mod metrics;
-mod presets;
-mod recon;
-mod web;
+// The modules live in the library crate (`lib.rs`) so the fuzz crate can link
+// them; the binary consumes them the same way any external crate would.
+use opennetbench::{auth, auto, classify, cli, config, engine, logging, presets, recon, web};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
