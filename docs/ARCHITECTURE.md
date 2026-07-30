@@ -22,20 +22,26 @@ These are not policy promises, they fall out of how the tree is built. Full vers
 
 ```
 parse CLI
-  --list-presets   print and exit
+  --list-presets / --list-vectors   print and exit
   --save-config    build plan, write JSON, exit   (no consent, nothing fires)
   --ui-only        serve dashboard, exit
   run path:
-     legal notice + consent gate (auth::require_consent)   always
+     legal notice + consent gate (auth::require_consent, or --i-am-authorized asserts it)
+     --recon URL    run_recon, print the ranked report, exit   (no flood)
      resolve the plan:
-       --auto     characterize, recommend, build_config
-       --preset   build_config(preset, target)
-       --config   load_config(json)
-       none       interactive_flow
+       --auto       characterize, recommend, build_config
+       --preset     build_config(preset, target)
+       --config     load_config(json)
+       --vectors    build_flag_config   (fully scripted, no prompts)
+       none         interactive_flow
      if run_recon   run_recon, present, select or auto-approve target
-     final "execute this plan?" confirm
+     final "execute this plan?" confirm   (skipped by --i-am-authorized)
      engine::run(cfg, ctx)
 ```
+
+The binary is a thin shim. The modules live in a library crate (`src/lib.rs`) that
+`main.rs` consumes, which is what lets the out-of-tree fuzz harnesses link the
+parsers and the classifier in-process (see [FUZZING.md](FUZZING.md)).
 
 ## Config model (`config.rs`)
 
@@ -111,7 +117,9 @@ Backends, fastest first:
 
 ## Classifier (`classify.rs`)
 
-`classify(Signals, samples)` returns a verdict, a confidence, and evidence. Checked in order: the health probe first (ground truth, local exhaustion excluded, and if it dominates the probe is declared unreliable and we fall through rather than blame the target), then the service probe, then an L4-only fallback (stable probe means Healthy, no probe signal at all means Unknown), then the rate limiter (429s), then the WAF (403s plus a vendor fingerprint), then latency exhaustion (p99 over 3x baseline and over 25ms sustained for three samples), and finally Healthy for a clean 2xx run. Confidence is capped at 0.9, it reports likelihood and never proof, so it will not call a working WAF a vuln.
+`classify(Signals, samples)` returns a verdict, a confidence, and evidence. Checked in order: the health probe first (ground truth, local exhaustion excluded, and if it dominates the probe is declared unreliable and we fall through rather than blame the target), then the service probe, then an L4-only fallback (stable probe means Healthy, no probe signal at all means Unknown), then the rate limiter (429s), then the WAF (403s plus a vendor fingerprint), then latency exhaustion, and finally Healthy for a clean 2xx run.
+
+The p99 breach threshold is the strongest of three floors: a 3x ratio, a 25ms absolute delta, and a noise-relative bar (the median plus five MADs of the run's own quiet prefix), held for three consecutive samples. That noise term is what stops a jittery target crying wolf on ordinary variance while still letting a rock-stable one register a real 40ms stall. A server that fails fast behind a proxy, answering instant 5xx or 408 under load, is caught by a separate server-error branch even when latency never moves, and where a degradation is real the classifier also checks whether it tracked the load ramp and recovered once the load eased, both of which separate "we broke it" from "something else hiccuped." The L7 status signal covers every vector that completes HTTP requests, cache_bust and header_flood included. Confidence is capped at 0.9, it reports likelihood and never proof, so it will not call a working WAF a vuln.
 
 ## Cross-cutting
 
@@ -130,4 +138,6 @@ cargo test                     # unit and in-process integration tests
 ./install.sh                   # build and put opennetbench on PATH
 ```
 
-Tests cover the byte-level encoders (DNS wire format, HTTP/2 framing, Ethernet/IP frame build and checksums), the L2 parsers, the queue-slice partition, the HTML scanner, the latency histogram, an in-process traffic smoke test, and the classifier verdict matrix.
+Tests cover the byte-level encoders (DNS wire format, HTTP/2 framing, Ethernet/IP frame build and checksums), the L2 parsers, the queue-slice partition, the HTML and JS scanners, the recon differential and scoring, the latency histogram, in-process traffic and recon smoke tests against hand-rolled servers, and the classifier verdict matrix.
+
+On top of the unit suite, the pure parsers and the classifier are fuzzed with `cargo-fuzz`. The crate splits into a library (`src/lib.rs`) and the binary, and a `cfg(fuzzing)`-gated surface exposes the parsers and the verdict engine to libFuzzer without widening the public API. That campaign already found and fixed a real integer-overflow in the classifier. The harnesses and the methodology are in [FUZZING.md](FUZZING.md).
