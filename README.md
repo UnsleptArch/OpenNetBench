@@ -3,7 +3,7 @@
 **Single-origin adversarial load generator for authorized resilience testing.**
 Rust. GPLv3. Linux.
 
-**Note much of this was written by AI, as always I have tested the code however there may still be some LLM driven problems in the code for professional traffic generation I would watch its log very carefully -unslept**
+**Note some of this was written by AI, as always I have tested the code and fuzzed the code (methodology will come in docs soon) however there may still be some LLM driven problems in the code for professional traffic generation I would watch its log very carefully if you feel somethings off -unslept**
 
 
 Most load testers ask "how do you handle 10,000 happy shoppers that are always on the home page!!!!!11!" That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
