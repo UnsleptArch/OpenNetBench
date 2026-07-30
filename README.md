@@ -3,22 +3,14 @@
 **Single-origin adversarial load generator for authorized resilience testing.**
 Rust. GPLv3. Linux.
 
-<<<<<<< HEAD
-**Note some of this was written by AI, as always I have tested the code and fuzzed the code (methodology will come in docs soon) however there may still be some LLM driven problems in the code for professional traffic generation I would watch its log very carefully if you feel somethings off -unslept**
-=======
 **Note some of this was written by AI. As always I have tested the code and fuzzed the code (methodology is in [docs/FUZZING.md](docs/FUZZING.md)), however there may still be some LLM driven problems in the code. For professional traffic generation I would watch its logs very carefully if you feel somethings off -unslept**
->>>>>>> 47c3ba9 (docs: merge READMEs, cover AF_XDP + fuzzing, complete USAGE flags, add FUZZING.md)
 
 
 Most load testers ask "how do you handle 10,000 happy shoppers that are always on the home page!!!!!11!" That is a useful question and it is not the one that takes your service down. OpenNetBench asks the other one. It throws the traffic real attackers throw. Slowloris holds, HTTP/2 rapid reset, connection-table exhaustion, raw SYN and ACK floods at line rate, and then it watches the target with an independent probe and tells you flat out whether the thing broke or held.
 
 It runs twenty vectors from L3 to L7 off a single box. No amplification, no botnet, no C2. There is an optional SOCKS5 proxy for the L7 traffic if you want it, and the raw L4 stuff still goes out this host's own address, so it is not an anonymity tool and never pretends to be one. That lean design is deliberate and the reasoning is in [docs/SAFETY.md](docs/SAFETY.md). You may ask why, and the reason is because i was too lazy to implement all of that and it would look unprofessional on my CV or whatnot.
 
-<<<<<<< HEAD
-This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench hands you a verdict. (no hate to TRex very good DPDK implementation)
-=======
 This is not TRex. TRex hands you line-rate numbers and walks away. OpenNetBench hands you a verdict. (no hate to TRex, very good DPDK implementation)
->>>>>>> 47c3ba9 (docs: merge READMEs, cover AF_XDP + fuzzing, complete USAGE flags, add FUZZING.md)
 
 ---
 
@@ -44,13 +36,9 @@ Out comes a ranked list of endpoints by measured asymmetry, each tagged with the
 
 The send path was measured at **25.6 million packets per second** of 54-byte frames on a single desktop (Ryzen 7800X3D, 16 pinned shards, AF_PACKET plus batched `sendmmsg` with the qdisc bypassed). That is past 10GbE line rate. For anything up to and including a 10-gig target the tool is bound by the wire, not by the code.
 
-<<<<<<< HEAD
-That number matters because of the acceptance bar this was built against: crash general networking appliances fast in under thirty seconds fast. It does. On a live run the gateway (NETGEAR Nighthawk RS700S and also tested on an ASUS RT-BE96U and a Ubiquiti Cloud Gateway Max) went from answering to fully down in about six seconds, off state exhaustion, on wifi, nowhere near the code's ceiling.
-=======
 That default fast path needs no special hardware. It is a raw `AF_PACKET` socket that packs a thousand frames into a single `sendmmsg` and sets `PACKET_QDISC_BYPASS` so it never takes the qdisc spinlock that otherwise caps multicore scaling, and it runs on any NIC. For cards that can keep up there is a second backend behind `--xdp`: a pure-libc AF_XDP path that drops frames straight into a shared UMEM and out the driver's TX ring, one socket per hardware queue, so the send never touches the IP stack, netfilter or conntrack at all. No libbpf, no C toolchain in the default build, producer stores Release and completion reads Acquire. That is the kernel-bypass headroom above 10GbE for when the wire stops being the limit.
 
 That throughput matters because of the acceptance bar this was built against: crash general networking appliances in well under thirty seconds. It does. On live runs the gateway (a NETGEAR Nighthawk RS700S, and separately an ASUS RT-BE96U and a Ubiquiti Cloud Gateway Max) went from answering to fully down in about six seconds off state exhaustion, on wifi, nowhere near the code's ceiling.
->>>>>>> 47c3ba9 (docs: merge READMEs, cover AF_XDP + fuzzing, complete USAGE flags, add FUZZING.md)
 
 How the number was reached, in short. The send path was isolated from everything downstream that could lie about it. On wifi the wire capped at 60K while the generator was doing 759K, and on a veth pair it capped at 3.4M no matter how many threads pushed, so both of those were the delivery medium, not the sender. Only when the frames went at a discard interface that nothing downstream could bottleneck did the real ceiling show up at 25.6M, and every figure was read off the NIC's own `tx_packets` counter rather than what the tool believed it sent. That divergence between generated and wire counts is exactly how a medium wall gives itself away. The formal writeup, with the controls, the instrumentation, and the threats to validity, is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md), alongside the full harness breakdown and every ceiling on the way.
 
