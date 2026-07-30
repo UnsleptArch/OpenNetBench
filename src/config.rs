@@ -132,6 +132,26 @@ impl Vector {
         }
     }
 
+    /// Whether this vector's worker completes HTTP requests and reports status
+    /// codes via `Metrics::record_status` — i.e. it produces the application-layer
+    /// signal the classifier keys on (`l7_active`). This is exactly the set of
+    /// vectors dispatched to `http_flood::worker` (HttpFlood/HttpsOnly/RangeFlood
+    /// plus CacheBust and HeaderFlood, which reuse it) and `h2_flood::worker`.
+    /// Keeping it beside the vector list stops the classifier's gate from drifting
+    /// out of sync when a new HTTP vector is added — an omission there makes the
+    /// classifier silently discard that vector's own status codes.
+    pub fn records_http_status(self) -> bool {
+        matches!(
+            self,
+            Vector::HttpFlood
+                | Vector::HttpsOnly
+                | Vector::RangeFlood
+                | Vector::CacheBust
+                | Vector::HeaderFlood
+                | Vector::H2Flood
+        )
+    }
+
     /// Whether the vector needs raw socket access (root/CAP_NET_RAW).
     pub fn needs_root(self) -> bool {
         matches!(
@@ -310,5 +330,36 @@ mod duration_secs {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_secs(u64::deserialize(d)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_http_status_covers_every_http_completing_vector() {
+        use Vector::*;
+        // The exact set of vectors whose worker reads a response and calls
+        // record_status. CacheBust and HeaderFlood are the regression: they reuse
+        // http_flood::worker, so the classifier's l7_active gate must include them
+        // or it discards the status codes they recorded (verdict reads Healthy on
+        // a run that was really being blocked/500'd).
+        let expected = [HttpFlood, HttpsOnly, RangeFlood, CacheBust, HeaderFlood, H2Flood];
+        for v in Vector::ALL {
+            assert_eq!(
+                v.records_http_status(),
+                expected.contains(&v),
+                "records_http_status wrong for {:?}",
+                v.slug()
+            );
+        }
+        // Explicit guard on the two that were missing before.
+        assert!(Vector::CacheBust.records_http_status());
+        assert!(Vector::HeaderFlood.records_http_status());
+        // Hold / connectionless vectors produce no status codes.
+        assert!(!Vector::Slowloris.records_http_status());
+        assert!(!Vector::WebSocket.records_http_status());
+        assert!(!Vector::SynFlood.records_http_status());
     }
 }

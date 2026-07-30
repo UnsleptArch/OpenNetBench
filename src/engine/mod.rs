@@ -6,12 +6,12 @@
 //! them together and paces them.
 
 mod ack_flood;
-mod dns_flood;
+pub(crate) mod dns_flood;
 mod h2_continuation;
 mod h2_flood;
 mod h2_rapid_reset;
-mod histogram;
-mod http_flood;
+pub(crate) mod histogram;
+pub(crate) mod http_flood;
 mod icmp_flood;
 mod l2;
 mod net;
@@ -27,7 +27,7 @@ mod tcp_exhaust;
 mod tls_exhaust;
 mod udp_flood;
 mod websocket;
-mod wire;
+pub(crate) mod wire;
 #[cfg(feature = "xdp")]
 mod xdp;
 
@@ -724,16 +724,9 @@ pub async fn run(cfg: &RunConfig, ctx: RunContext) -> Result<()> {
     // L7 status codes are only produced by vectors that complete a request and
     // read a response. Slow-hold and connectionless vectors never do, so the
     // classifier must lean on the health/service probe for them — not assume
-    // "no HTTP signal" means the service is fine.
-    let l7_active = cfg.vectors.iter().any(|p| {
-        matches!(
-            p.vector,
-            Vector::HttpFlood
-                | Vector::HttpsOnly
-                | Vector::RangeFlood
-                | Vector::H2Flood
-        )
-    });
+    // "no HTTP signal" means the service is fine. `records_http_status` is the
+    // authoritative set (kept next to the vector definitions so it can't drift).
+    let l7_active = cfg.vectors.iter().any(|p| p.vector.records_http_status());
     let signals = Signals {
         requests: agg(&metrics_all, |m| m.requests_sent.load(Relaxed)),
         errors: agg(&metrics_all, |m| m.errors.load(Relaxed)),

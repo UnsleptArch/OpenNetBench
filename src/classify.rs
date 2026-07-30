@@ -300,7 +300,11 @@ pub fn classify(sig: &Signals, samples: &[LatencySample]) -> Classification {
     // A verdict several of these agree on is reported with higher confidence than
     // one resting on a single measurement — see `corroborate`.
     let probe_conclusive = sig.probe_total.saturating_sub(sig.probe_local_inconclusive);
-    let probe_reliable = sig.probe_local_inconclusive * 2 <= sig.probe_total;
+    // Reliable when local-exhaustion failures are at most half the probes.
+    // Written as `x <= total/2` (not `x*2 <= total`) so it can't overflow u32 for
+    // a pathological count — equivalent for integers, and overflow silently wraps
+    // in release, which would flip the verdict.
+    let probe_reliable = sig.probe_local_inconclusive <= sig.probe_total / 2;
     let probe_fail_frac = if probe_reliable && probe_conclusive > 0 {
         sig.probe_failures as f64 / probe_conclusive as f64
     } else {
@@ -786,6 +790,23 @@ mod tests {
         s.probe_peak_ms = Some(200.0); // 40x, +195ms
         s.probe_total = 10;
         assert_eq!(classify(&s, &[]).verdict, Verdict::Degrading);
+    }
+
+    #[test]
+    fn extreme_probe_counts_do_not_overflow() {
+        // Regression (found by the classify fuzz harness): `probe_local * 2`
+        // overflowed u32 — panics under overflow checks, wraps in release and
+        // flips the reliability gate. A pathological count must classify cleanly.
+        let mut s = base_signals();
+        s.l7_active = false;
+        s.probe_baseline_ms = Some(5.0);
+        s.probe_total = 10;
+        s.probe_local_inconclusive = u32::MAX; // would overflow `x * 2`
+        s.probe_failures = u32::MAX;
+        let c = classify(&s, &[]); // must not panic
+        // Local exhaustion dominates → probe is unreliable, never a target-down.
+        assert_ne!(c.verdict, Verdict::Down);
+        assert_ne!(c.verdict, Verdict::Degrading);
     }
 
     #[test]
