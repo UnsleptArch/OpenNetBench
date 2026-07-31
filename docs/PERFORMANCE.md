@@ -1,6 +1,33 @@
 # Performance
 
-The send path, the numbers, and how they were actually measured. No vibes, every figure here came off a NIC counter or a generation counter that was cross-checked against one.
+*The send path, the numbers, and how they were actually measured. No vibes — every figure here
+came off a NIC counter or a generation counter that was cross-checked against one. This document
+states the headline result, the constant-factor analysis that explains it, the formal measurement
+methodology with its threats to validity, and the honest boundary of what has and has not been
+demonstrated.*
+
+---
+
+## Table of Contents
+
+1. [The Acceptance Bar](#the-bar)
+2. [The Headline Number](#the-headline-number)
+3. [Why It Is Fast: The Constant-Factor Analysis](#why-it-is-fast)
+4. [The Shard-Collapse Parallelism Model](#the-shard-collapse-parallelism-model)
+5. [How It Was Measured, and Every Ceiling on the Way](#how-it-was-measured-and-every-ceiling-on-the-way)
+6. [Formal Methodology: Isolating the Send-Side Ceiling](#formal-methodology-isolating-the-send-side-throughput-ceiling)
+7. [AF_XDP versus AF_PACKET](#af_xdp-versus-af_packet-which-to-use)
+8. [What Is Left](#what-is-left)
+
+---
+
+## The send path in one paragraph
+
+The tool builds each raw frame in userspace (`wire.rs`), buffers many frames, and flushes them to
+the driver with the fewest possible syscalls, on CPU-pinned shards that never migrate, bypassing
+every kernel stage that would otherwise serialise or duplicate the work. The result is a generator
+whose ceiling is the medium, not the code, for every target at or below 10 GbE. Everything below is
+the evidence for that claim, stated in the register a skeptical reviewer would demand.
 
 ## The bar
 
@@ -28,6 +55,53 @@ Generating packets fast is not an algorithm problem, the send loop is O(P) with 
 4. **One core per shard.** Each shard thread is pinned with `sched_setaffinity`, so the frame prefix, the ring indices and the DMA'd-back completion descriptors all stay warm in one core's cache with no migration bounce.
 
 Frame prefixes are precomputed once per shard and only the L4 bytes get rewritten per packet, so there is no per-frame formatting either.
+
+### The four costs, quantified in principle
+
+It is worth being explicit that the send loop is asymptotically trivial — O(P) in the number of
+packets, with a fixed cost per packet — so there is no algorithmic win available and every gain is a
+constant-factor gain. The four constants the fast path attacks, in rough order of the cost they
+carry on the naïve path:
+
+1. **Syscall transition cost.** A `sendto` per frame pays the user/kernel mode-switch, the socket
+   lookup, and the copy on every single packet. Amortising ~1000 frames into one `sendmmsg` divides
+   the first two by ~1000; the XDP path collapses a batch into a single wakeup. This is the dominant
+   term and the single biggest win.
+2. **Lock contention.** The per-net-device qdisc spinlock serialises transmit across cores, so
+   adding cores stops helping once they all contend on it. `PACKET_QDISC_BYPASS` removes the lock
+   from the path; AF_XDP never touches it. This is what converts the generator from single-core-bound
+   to core-scaling.
+3. **Per-packet kernel work.** The OUTPUT netfilter chain and conntrack state creation run for every
+   packet on the kernel path, so a unique-flow flood exhausts the *generator's* own conntrack table
+   before the target — the failure that killed an early router run, where our own machine died first.
+   Injecting full frames at the driver bypasses both.
+4. **Cache residency.** A shard thread that migrates between cores refills its L1/L2 (frame prefix,
+   ring indices, DMA-returned completion descriptors) on every migration. Pinning each shard with
+   `sched_setaffinity` keeps that working set warm on one core with no migration bounce.
+
+The first three are removed outright by the fast backends; the fourth is removed by the parallelism
+model below.
+
+## The shard-collapse parallelism model
+
+The unit of parallelism on the raw path is the **shard**, not the logical worker — a distinction
+that is both a performance property and the fix for a real starvation bug.
+
+On the raw vectors, worker index 0 is the *shard leader*: it resolves Layer 2 once, then spawns one
+pinned OS thread per shard, and every other logical worker of that vector no-ops. CPUs are
+partitioned across the *concurrently running* raw vectors by `l2::queue_slice`, so a `router` run
+(`syn_flood` + `ack_flood`) gives `syn` the low half of the cores and `ack` the high half, each shard
+pinned to its own core. Each shard owns its frame prefix, its send ring, and its completion
+descriptors, so there is no cross-shard sharing on the hot path and therefore no cross-shard cache
+traffic or contention.
+
+The bug this model fixed is instructive. The previous per-logical-worker model mapped each worker to
+a Tokio blocking thread. With a large `concurrency`, the first raw vector's workers saturated Tokio's
+bounded blocking-thread pool (default ~512), so the second raw vector's workers never got a thread —
+the second vector in a two-vector router run silently never ran. Collapsing to one pinned thread per
+shard, partitioned across vectors, both removes the migration cost and guarantees every running vector
+gets its share of cores. The same `queue_slice` partition is what keeps two raw vectors on one NIC
+from colliding on transmit queue 0 (see [INTERNALS.md](INTERNALS.md) §8.3).
 
 ## How it was measured, and every ceiling on the way
 
