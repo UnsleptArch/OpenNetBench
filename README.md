@@ -173,6 +173,7 @@ Good-faith authorized testing only. Your own systems, your lab, a CTF, or a clie
 - [docs/USAGE.md](docs/USAGE.md) — every flag, preset, and config knob
 - [docs/VECTORS.md](docs/VECTORS.md) — the twenty vectors in detail
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine is built, module by module
+- [docs/INTERNALS.md](docs/INTERNALS.md) — code-level internals reference: data structures, memory ordering, and the numerical methods
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — the fast path, the numbers, the benchmarking method
 - [docs/FUZZING.md](docs/FUZZING.md) — the fuzz harnesses, what they cover, and the bug they caught
 - [docs/SAFETY.md](docs/SAFETY.md) — the threat model, what it deliberately is not, and why
