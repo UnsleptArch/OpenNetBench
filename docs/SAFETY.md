@@ -333,4 +333,4 @@ For a reviewer verifying the safety claims against the source, the specific thin
 
 Each item is verifiable by reading the cited code, which is the point: the safety model is a
 property of the source, and this checklist is how a skeptic confirms it rather than takes it on
-faith.
+faith. **I usually hate safety notes like this as they just feel undermining and very "legal" and while I know that this note probably won't stop anyone with bad intentions I much more felt a reason to include one in this project because of how easy and disruptive it is to use. Please please please don't get yourself in trouble while using projects like this, there can be some really big consequences.** 
